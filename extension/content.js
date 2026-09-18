@@ -1,14 +1,11 @@
 const SCROLL_DEBOUNCE = 3000;
 const API_ENDPOINT = 'http://localhost:8000/api/verify';
 
-let enabled = true;
+let enabled = false;
 let lastViewportText = '';
 let lastResult = { label: null, explanation: [] };
 let panelOpen = false;
 const textCache = new Map();
-
-chrome.storage.local.get(['enabled'], (r) => { enabled = r.enabled !== false; });
-chrome.storage.onChanged.addListener((c) => { if (c.enabled) enabled = c.enabled.newValue; });
 
 // --- Indicator dot ---
 
@@ -109,6 +106,30 @@ document.addEventListener('click', (e) => {
   if (panelOpen && !panel.contains(e.target)) hidePanel();
 });
 
+// --- Enabled state (storage-driven, live-updating, opt-in by default) ---
+
+function applyEnabledState() {
+  if (!enabled) {
+    hidePanel();
+    indicator.style.display = 'none';
+  } else {
+    indicator.style.display = '';
+  }
+}
+
+chrome.storage.local.get(['enabled'], (r) => {
+  enabled = r.enabled === true; // opt-in: only ON if explicitly set to true
+  applyEnabledState();
+  updateIndicator(); // only run the first scan once we know the real stored value
+});
+
+chrome.storage.onChanged.addListener((c) => {
+  if (c.enabled) {
+    enabled = c.enabled.newValue === true;
+    applyEnabledState();
+  }
+});
+
 // --- API ---
 
 const TEXT_CACHE_MAX = 50;
@@ -166,7 +187,7 @@ function getViewportText() {
 }
 
 async function updateIndicator() {
-  if (!enabled) return;
+  if (!enabled) return; // hard gate: no scan, no API call, no cost, while inactive
   const text = getViewportText();
   if (!text || text.length < 200) return;
   if (text === lastViewportText) return;
@@ -191,4 +212,6 @@ window.addEventListener('scroll', () => {
   scrollTimer = setTimeout(updateIndicator, SCROLL_DEBOUNCE);
 }, { passive: true });
 
-updateIndicator();
+// Note: the initial updateIndicator() call happens inside the
+// chrome.storage.local.get callback above, once the real `enabled`
+// value is known — not here at load time.
