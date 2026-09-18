@@ -31,7 +31,7 @@ app.add_middleware(
 )
 
 MODEL_NAME = os.getenv("VERIFY_MODEL", "gemini-2.5-flash")
-
+print("Using model:", MODEL_NAME)
 
 def build_validation_prompt(text: str) -> str:
     return (
