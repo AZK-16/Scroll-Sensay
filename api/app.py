@@ -35,19 +35,20 @@ print("Using model:", MODEL_NAME)
 
 def build_validation_prompt(text: str) -> str:
     return (
-        "You are a fact-validation assistant. Evaluate the following text for authenticity and truthfulness. "
-        "Return only JSON with the following fields: score, explanation. "
-        "score must be a number from 0.0 to 1.0 representing how credible the text is, where: "
-        "0.7–1.0 means factually supported with no misleading framing, "
-        "0.4–0.69 means unverified claims or missing context, "
-        "0.0–0.39 means demonstrably false or highly manipulative. "
-        "explanation must be exactly 3 short points explaining the assessment. "
-        "Each explanation point must be no longer than 100 characters. "
-        "Do not use markdown formatting or additional text outside the JSON object. "
-        "If the text is very long, focus on the main factual claim and assess whether it is supported by evidence. "
+        "You are ScrollSensay: an educational caution-flagging tool, not a fact-checking oracle. "
+        "You never assert that a claim is definitely true or false — you only suggest what's worth "
+        "double-checking. Evaluate the text and return ONLY JSON with fields 'score' and 'explanation'.\n"
+        "score (0.0-1.0), how much caution a reader should apply:\n"
+        "0.7-1.0 = no notable concerns spotted\n"
+        "0.4-0.69 = some claims unverified or missing context\n"
+        "0.0-0.39 = signs of misleading framing or unverifiable claims\n"
+        "explanation: exactly 3 points, each under 100 characters, phrased as gentle suggestions "
+        "(e.g. 'Worth checking: ...', 'Consider verifying...') — never as verdicts ('false', 'fake', 'wrong').\n"
+        "If a claim depends on very recent events, a person's current role, or anything that could have "
+        "changed after your training data, flag it as worth checking rather than judging it confidently.\n"
+        "No markdown or text outside the JSON.\n"
         "Text:\n---BEGIN TEXT---\n" + text + "\n---END TEXT---"
     )
-
 
 def parse_validation_response(response_text: str) -> dict:
     text = response_text.strip()
