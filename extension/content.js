@@ -149,6 +149,15 @@ async function callAPI(text, retries = 3) {
     await new Promise(r => setTimeout(r, retryAfter * 1000));
     return callAPI(text, retries - 1);
   }
+
+  // Transient upstream failure (e.g. Gemini temporarily overloaded) — retry
+  // automatically after a short wait instead of leaving the indicator stuck.
+  if (res.status === 502 || res.status === 503) {
+    if (retries <= 0) return null;
+    await new Promise(r => setTimeout(r, 4000));
+    return callAPI(text, retries - 1);
+  }
+
   if (!res.ok) throw new Error(`API ${res.status}`);
   const data = await res.json();
 
