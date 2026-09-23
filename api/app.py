@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-MODEL_NAME = os.getenv("VERIFY_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("VERIFY_MODEL", "gemini-3.6-flash")
 print("Using model:", MODEL_NAME)
 
 def build_validation_prompt(text: str) -> str:
