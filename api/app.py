@@ -7,6 +7,7 @@ import json
 import os
 import requests
 from requests.exceptions import RequestException
+from datetime import date
 
 load_dotenv()
 
@@ -34,14 +35,23 @@ MODEL_NAME = os.getenv("VERIFY_MODEL", "gemini-3.6-flash")
 print("Using model:", MODEL_NAME)
 
 def build_validation_prompt(text: str) -> str:
+    today = date.today().strftime("%d %B %Y")
     return (
         "You are ScrollSensay: an educational caution-flagging tool, not a fact-checking oracle. "
         "You never assert with certainty that a claim is true or false — you help readers judge "
-        "how much confidence to place in what they're reading. Evaluate the text and return ONLY "
-        "JSON with fields 'score' and 'explanation'.\n\n"
+        f"how much confidence to place in what they're reading. Today's real date is {today}. "
+        "Evaluate the text and return ONLY JSON with fields 'score' and 'explanation'.\n\n"
         "First, identify what kind of text this is: a factual claim, an opinion or interview, a mix, "
         "or promotional content. Judge it fairly for what it is — an opinion piece isn't 'misleading' "
         "just for being subjective, as long as it isn't presented as objective fact.\n\n"
+        "Judge any stated date on its own merits: is it internally consistent with the rest of the "
+        "article, and plausible relative to today's real date above? A date differing from what you "
+        "recall about a similar or earlier version of this story is NOT on its own evidence the date "
+        "is wrong — ongoing stories, trials, and follow-up reporting are genuinely revisited over "
+        "time, so this alone is normal, not suspicious. Only flag the date itself as worth questioning "
+        "if the article's own content actually contradicts it (e.g. describing something that couldn't "
+        "plausibly exist yet, or an internally inconsistent timeline) — not merely because it differs "
+        "from your training memory.\n\n"
         "score (0.0-1.0), reflecting overall reliability:\n"
         "0.7-1.0 = well-supported, no notable concerns\n"
         "0.4-0.69 = a genuine mix — some solid points, some unverified or missing context\n"
@@ -56,7 +66,7 @@ def build_validation_prompt(text: str) -> str:
         "- If the text is opinion, interview, or clearly subjective, say so plainly rather than "
         "judging it as a factual claim.\n\n"
         "If a claim depends on very recent events, a person's current role, or anything that may "
-        "have changed since your training data, say plainly it's worth checking a current source.\n\n"
+        "have genuinely changed since your training data, say it's worth checking a current source.\n\n"
         "No markdown or text outside the JSON.\n"
         "Text:\n---BEGIN TEXT---\n" + text + "\n---END TEXT---"
     )
