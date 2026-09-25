@@ -5,7 +5,6 @@ let enabled = false;
 let lastViewportText = '';
 let lastResult = { label: null, explanation: [] };
 let panelOpen = false;
-const textCache = new Map();
 
 // --- Indicator dot ---
 
@@ -117,22 +116,58 @@ function applyEnabledState() {
   }
 }
 
+const SCAN_READY_RETRY_DELAY = 500;
+const SCAN_READY_MAX_RETRIES = 6; // ~3 seconds total before giving up quietly
+
+function attemptScanUntilReady(retriesLeft = SCAN_READY_MAX_RETRIES) {
+  if (!enabled) return; // re-checked on every retry, not just the first attempt
+  const text = getViewportText();
+  if (text && text.length >= 200) {
+    updateIndicator(); // real content found — run the actual scan now
+    return;
+  }
+  if (retriesLeft <= 0) return; // give up quietly; a scroll will trigger it naturally later
+  setTimeout(() => attemptScanUntilReady(retriesLeft - 1), SCAN_READY_RETRY_DELAY);
+}
+
 chrome.storage.local.get(['enabled'], (r) => {
   enabled = r.enabled === true; // opt-in: only ON if explicitly set to true
   applyEnabledState();
-  updateIndicator(); // only run the first scan once we know the real stored value
+  attemptScanUntilReady(); // retry a few times in case page content hasn't rendered in yet
 });
 
 chrome.storage.onChanged.addListener((c) => {
   if (c.enabled) {
     enabled = c.enabled.newValue === true;
     applyEnabledState();
+    if (enabled) attemptScanUntilReady(); // start scanning as soon as toggled on, not just on next scroll
   }
 });
 
 // --- API ---
 
 const TEXT_CACHE_MAX = 50;
+const SESSION_CACHE_KEY = 'hh_text_cache';
+
+function loadCacheFromSession() {
+  try {
+    const raw = sessionStorage.getItem(SESSION_CACHE_KEY);
+    if (!raw) return new Map();
+    return new Map(JSON.parse(raw));
+  } catch (err) {
+    return new Map(); // unavailable or corrupted — start fresh, extension still works normally
+  }
+}
+
+function saveCacheToSession() {
+  try {
+    sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify([...textCache.entries()]));
+  } catch (err) {
+    // sessionStorage unavailable/full — fail silently, cache just won't persist this time
+  }
+}
+
+const textCache = loadCacheFromSession();
 
 async function callAPI(text, retries = 3) {
   if (textCache.has(text)) return textCache.get(text);
@@ -171,13 +206,37 @@ async function callAPI(text, retries = 3) {
     textCache.delete(textCache.keys().next().value);
   }
   textCache.set(text, result);
+  saveCacheToSession();
   return result;
 }
 
 // --- Viewport scan ---
 
+function getContentRoot() {
+  // Some sites (news articles) have exactly one article/main container for
+  // the whole page. Others (social feeds) have MANY — one per post — so we
+  // can't just take the first match; we need whichever one is actually
+  // visible in the viewport right now.
+  const candidates = document.querySelectorAll('article, main, [role="main"]');
+  if (candidates.length === 0) return document.body;
+  if (candidates.length === 1) return candidates[0];
+
+  let best = null;
+  let bestVisibleHeight = 0;
+  candidates.forEach((el) => {
+    const rect = el.getBoundingClientRect();
+    const visibleHeight = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+    if (visibleHeight > bestVisibleHeight) {
+      bestVisibleHeight = visibleHeight;
+      best = el;
+    }
+  });
+  return best || document.body;
+}
+
 function getViewportText() {
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const root = getContentRoot();
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   const parts = [];
   let node;
 
