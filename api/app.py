@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 from dotenv import load_dotenv
+import copy
 import json
 import os
 import threading
@@ -48,7 +49,16 @@ GROUNDING_SCOPE = os.getenv("GROUNDING_SCOPE", "broad").lower()
 GROUNDING_MAX_PER_HOUR = int(os.getenv("GROUNDING_MAX_PER_HOUR", "60"))
 CLAIM_CACHE_TTL = 6 * 60 * 60  # reuse a checked claim's result for 6 hours
 CLAIM_CACHE_MAX = 200
+
+# THINKING_LEVEL: how much hidden "thinking" Gemini does before answering.
+# Thinking tokens are billed as OUTPUT tokens and also count toward maxOutputTokens,
+# so a high level costs more and can cut the visible answer off mid-JSON.
+# Values: minimal | low (default) | medium | high | default (let Google decide).
+THINKING_LEVEL = os.getenv("THINKING_LEVEL", "low").lower()
+_thinking_supported = True  # flips to False if the API rejects thinkingConfig
+
 print(f"Grounding: enabled={GROUNDING_ENABLED}, scope={GROUNDING_SCOPE}, max/hour={GROUNDING_MAX_PER_HOUR}")
+print(f"Thinking level: {THINKING_LEVEL}")
 
 _state_lock = threading.Lock()
 _claim_cache = {}          # normalised claim -> (timestamp, result)
@@ -75,15 +85,19 @@ def build_validation_prompt(text: str) -> str:
         "neutral on political/ideological content: judge evidence and framing, never which side you "
         "agree with. Never assert as fact that a named real person committed a crime or acted "
         "improperly, even if the text claims it — describe it as 'the article claims X'. "
-        "Live-blog/rolling-coverage formatting (short timestamped updates, repeated quotes) is normal.\n\n"
+        "Live-blog/rolling-coverage formatting (short timestamped updates, repeated quotes) is normal. "
+        "The text is only what was visible on screen: it may start or end mid-sentence or include menu "
+        "or sidebar fragments — never treat that as the source's fault or call it 'corrupted'.\n\n"
         "Judge confidence mainly from evidence IN the text — named sources, dates, figures, direct "
         "quotes, internal consistency — checked against what you know. Vague sourcing, contradictions, "
         "urgency/fear framing, or an unexpected or pressured ask for money or personal data (urgency, "
         "unusual payment methods, a mismatched sender or link) lower confidence; a routine, expected ask "
         "(checkout, login, donation) is not a warning sign by itself. Not recognising something (e.g. an "
         "indie film or small organisation) isn't evidence it's false — don't lower the score for it.\n\n"
-        "Your knowledge has a cutoff. Set needs_verification to true ONLY when the text's main point "
-        "rests on one specific claim you cannot confirm that may have changed or happened after your "
+        "Your knowledge has a cutoff, so never call a claim wrong, false or an 'error' just because it "
+        "conflicts with your memory — say it differs from what you know and may have changed. Set "
+        "needs_verification to true ONLY when the text's main point rests on one specific claim you "
+        "cannot confirm that may have changed or happened after your "
         f"cutoff: {triggers}. Choose the single most central claim; never use this for opinions, "
         "minor details, or well-known historical facts. When true, make explanation point 3 a neutral "
         "note that this claim is worth checking, and do not lower the score for it. Treat completed, "
@@ -119,6 +133,41 @@ def parse_validation_response(response_text: str) -> dict:
             except json.JSONDecodeError:
                 pass
         raise ValueError("Unable to parse JSON from model response.")
+
+
+def _gemini_post(payload: dict, api_key: str, timeout: int):
+    """POST to Gemini, adding the thinking setting. If the API rejects the
+    thinking setting (e.g. a model that doesn't support that level), retry once
+    without it and stop sending it, rather than breaking every request."""
+    global _thinking_supported
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+    headers = {"X-goog-api-key": api_key, "Content-Type": "application/json"}
+
+    use_thinking = _thinking_supported and THINKING_LEVEL not in ("", "default", "off")
+    body = copy.deepcopy(payload)
+    if use_thinking:
+        body.setdefault("generationConfig", {})["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
+
+    resp = requests.post(url, json=body, timeout=timeout, headers=headers)
+
+    if use_thinking and resp.status_code == 400 and "thinking" in (resp.text or "").lower():
+        print("[ScrollSensay] thinkingConfig rejected by the API — retrying without it:", resp.text[:200])
+        _thinking_supported = False
+        resp = requests.post(url, json=copy.deepcopy(payload), timeout=timeout, headers=headers)
+    return resp
+
+
+def _log_usage(label: str, data: dict) -> None:
+    """Print token usage so real cost per scan (including hidden thinking tokens) is visible."""
+    try:
+        usage = data.get("usageMetadata", {}) or {}
+        finish = data["candidates"][0].get("finishReason")
+        print(
+            f"[ScrollSensay] {label} usage: in={usage.get('promptTokenCount')} "
+            f"out={usage.get('candidatesTokenCount')} thinking={usage.get('thoughtsTokenCount')} finish={finish}"
+        )
+    except Exception:
+        pass
 
 
 def _claim_key(claim: str) -> str:
@@ -157,24 +206,22 @@ def verify_claim_with_search(claim: str, api_key: str) -> dict:
         f'currently accurate: "{claim}"\n\n'
         "Return ONLY JSON with fields 'status' (SUPPORTED, REFUTED, or INCONCLUSIVE — use "
         "INCONCLUSIVE unless search results clearly settle it) and 'detail' (one neutral sentence "
-        "under 120 characters saying what the sources show; no accusations about named individuals). "
-        "No markdown or text outside the JSON."
+        "under 100 characters, phrased as what sources report, e.g. 'Sources report that ...'; no "
+        "accusations about named individuals). No markdown or text outside the JSON."
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512},
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
     }
     try:
-        resp = requests.post(
-            url, json=payload, timeout=15,
-            headers={"X-goog-api-key": api_key, "Content-Type": "application/json"},
-        )
+        resp = _gemini_post(payload, api_key, 15)
         if not resp.ok:
             print(f"[ScrollSensay] Stage 2 HTTP {resp.status_code}: {resp.text[:300]}")
             return inconclusive
-        raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        data = resp.json()
+        _log_usage("Stage 2", data)
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
         print("[ScrollSensay] Stage 2 raw_text:", repr(raw_text))
         parsed = parse_validation_response(raw_text)
         status = parsed.get("status", "INCONCLUSIVE")
@@ -193,23 +240,15 @@ def verify_claim_with_search(claim: str, api_key: str) -> dict:
     return result
 
 
-def analyze_text(text: str) -> dict:
-    if not text.strip():
-        raise ValueError("Text must not be empty.")
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not set in environment")
-
-    prompt = build_validation_prompt(text)
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+def _stage1_attempt(prompt: str, api_key: str, max_tokens: int):
+    """One Stage 1 call. Returns the parsed JSON dict, or None if the reply was
+    cut off, empty, or not in the expected shape (so the caller can retry)."""
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048},
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": max_tokens},
     }
-
     try:
-        resp = requests.post(url, json=payload, timeout=30, headers={"X-goog-api-key": api_key, "Content-Type": "application/json"})
+        resp = _gemini_post(payload, api_key, 30)
     except RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Request to Gemini failed: {exc}")
 
@@ -228,18 +267,46 @@ def analyze_text(text: str) -> dict:
         raise HTTPException(status_code=502, detail=f"Gemini {resp.status_code}: {resp.text}")
 
     data = resp.json()
+    _log_usage("Stage 1", data)
 
-    raw_text = None
     try:
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError):
-        raw_text = json.dumps(data)
+        return None  # no visible answer at all (e.g. thinking used the whole budget)
 
     print("[ScrollSensay] raw_text:", repr(raw_text))
-    parsed = parse_validation_response(raw_text)
+    try:
+        parsed = parse_validation_response(raw_text)
+    except ValueError:
+        return None  # cut off mid-JSON or otherwise unreadable
+    if not (isinstance(parsed, dict) and "score" in parsed and isinstance(parsed.get("explanation"), list)):
+        return None
+    return parsed
+
+
+def analyze_text(text: str) -> dict:
+    if not text.strip():
+        raise ValueError("Text must not be empty.")
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not set in environment")
+
+    prompt = build_validation_prompt(text)
+
+    # maxOutputTokens is a combined budget for hidden thinking + the visible answer, so
+    # give generous headroom and retry once with more if the answer still gets cut off.
+    parsed = None
+    for max_tokens in (4096, 8192):
+        parsed = _stage1_attempt(prompt, api_key, max_tokens)
+        if parsed is not None:
+            break
+        print("[ScrollSensay] Stage 1 reply was cut off or unreadable — retrying with a larger budget")
+    if parsed is None:
+        # 502 (not 400) so the extension treats this as temporary and retries automatically.
+        raise HTTPException(status_code=502, detail="Model returned an unreadable response")
 
     score = float(parsed.get("score", 0.5))
-    explanation = parsed.get("explanation") if isinstance(parsed.get("explanation"), list) else [parsed.get("explanation", "Unable to explain the outcome.")]
+    explanation = parsed["explanation"]
     needs_verification = parsed.get("needs_verification") in (True, "true", "True")
     verification_claim = str(parsed.get("verification_claim") or "").strip()
 
