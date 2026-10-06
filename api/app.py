@@ -63,6 +63,12 @@ def _within_limit(kind: str, limit: int) -> bool:
         return True
 
 
+def _same_claim(a: str, b: str) -> bool:
+    """True only if two claims are identical apart from case and punctuation (no fuzzy matching)."""
+    norm = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())
+    return bool(a) and bool(b) and norm(a) == norm(b)
+
+
 # ------------------------------------------------------------------ prompt
 def build_validation_prompt(text: str) -> str:
     today = date.today().strftime("%d %B %Y")
@@ -70,9 +76,9 @@ def build_validation_prompt(text: str) -> str:
         "You are ScrollSensay: an educational caution tool, not a fact-checking oracle. You never "
         "assert a claim is definitely true or false — you help readers judge how much confidence to "
         f"place in what they're reading. Today's real date is {today}. Return ONLY JSON with fields "
-        "'score', 'explanation', 'needs_verification' (true/false) and 'verification_claim' (the one "
-        "claim to check, as a short self-contained statement in plain minimal form — no titles, ages or "
-        "extra detail, e.g. \"Jane Doe is the CEO of Acme\" — if needs_verification is true; else \"\").\n\n"
+        "'score', 'explanation', 'needs_verification' (true/false), 'verification_claim' and "
+        "'clash_claim'. Each claim is a short self-contained statement in plain minimal form — no "
+        "titles, ages or extra detail, e.g. \"Jane Doe is the CEO of Acme\" — or \"\" if not used.\n\n"
         "Identify what the text is (factual claim, opinion/interview, mix, promotional) and judge it "
         "fairly for that type — a subjective opinion isn't 'misleading' unless presented as fact. Stay "
         "neutral on political/ideological content: judge evidence and framing, never which side you "
@@ -87,16 +93,18 @@ def build_validation_prompt(text: str) -> str:
         "unusual payment methods, a mismatched sender or link) lower confidence; a routine, expected ask "
         "(checkout, login, donation) is not a warning sign by itself. Not recognising something (e.g. an "
         "indie film or small organisation) isn't evidence it's false — don't lower the score for it.\n\n"
-        "Your knowledge has a cutoff: a clash with your memory is NOT evidence, so never mention one in "
-        "the explanation or let it lower the score (noting what matches your knowledge is fine). Set "
-        "needs_verification to true ONLY when one specific, checkable claim that you cannot confirm from "
-        "your own knowledge materially affects how far to trust the text (it may have changed or "
-        "happened after your cutoff, or it clashes with your memory) — on any topic. If several "
-        "qualify, choose the one that matters most; never use this for opinions, minor details, or "
-        "well-known historical facts. When true, make explanation point 3 a neutral note that this "
-        "claim is worth checking, and do not lower the score for it. Treat completed, historical, "
-        "time-stamped events with normal confidence. For ages or date maths, calculate against "
-        "today's date, checking whether a birthday has passed this year.\n\n"
+        "Your knowledge has a cutoff, and out-of-date knowledge feels like certainty (e.g. 'X is the "
+        "Prime Minister' may simply be newer than what you know). So a clash with your memory is NOT "
+        "evidence: never criticise it, call it a mistake, or let it lower the score (noting what "
+        "matches your knowledge is fine). Instead use two optional slots, each one specific, checkable "
+        "claim on any topic — never an opinion, minor detail or well-known historical fact: "
+        "(1) needs_verification=true with verification_claim: the one claim you cannot confirm that "
+        "matters most to trusting the text; (2) clash_claim: the one claim that conflicts with your "
+        "memory. If slot (1) is used, make explanation point 3 a neutral note that this claim is "
+        "worth checking; if slot (2) is used, make point 2 the same kind of neutral note — a plain "
+        "'worth checking', not a verdict. Don't lower the score for either. Treat completed, "
+        "historical, time-stamped events with normal confidence. For ages or date maths, calculate "
+        "against today's date, checking whether a birthday has passed this year.\n\n"
         "score (0.0-1.0):\n"
         "0.7-1.0 = well-supported by evidence in the text, no notable concerns\n"
         "0.4-0.69 = a genuine mix — some solid points, some unverified or missing context\n"
@@ -193,32 +201,43 @@ def _parse_scan(reply):
     return None
 
 
-def _live_check(claim: str, tally: dict):
-    """Stage 2: check ONE claim with live Google Search. Returns (status, detail).
-    Any problem (off, over the limit, error, unreadable) -> INCONCLUSIVE, so Stage 1's result stands."""
+def _live_check(claims: list, tally: dict) -> list:
+    """Stage 2: check one or two claims with ONE live Google Search call.
+    Returns a (status, detail) pair per claim, in order. Any problem (off, over the limit,
+    error, unreadable) -> INCONCLUSIVE for every claim, so Stage 1's result stands."""
+    unknown = [("INCONCLUSIVE", "")] * len(claims)
     if not GROUNDING_ENABLED:
-        return "INCONCLUSIVE", ""
+        return unknown
     if not _within_limit("search", MAX_SEARCHES_PER_HOUR):
         print("[ScrollSensay] search limit reached — skipping live check")
-        return "INCONCLUSIVE", ""
+        return unknown
     today = date.today().strftime("%d %B %Y")
+    listing = "\n".join(f'{i}. "{c}"' for i, c in enumerate(claims, 1))
     prompt = (
-        f"Today's real date is {today}. Using live search, check whether this specific claim is "
-        f'currently accurate: "{claim}"\n\n'
-        "Return ONLY JSON with fields 'status' (SUPPORTED, REFUTED, or INCONCLUSIVE — use "
-        "INCONCLUSIVE unless search results clearly settle it) and 'detail' (one neutral sentence "
-        "under 100 characters, phrased as what sources report, e.g. 'Sources report that ...'; no "
-        "accusations about named individuals). No markdown or text outside the JSON."
+        f"Today's real date is {today}. Using live search, check whether each of these claims is "
+        f"currently accurate:\n{listing}\n\n"
+        "Return ONLY JSON: {\"results\": [...]} with one object per claim, in the same order, each "
+        "with 'status' (SUPPORTED, REFUTED, or INCONCLUSIVE — use INCONCLUSIVE unless search results "
+        "clearly settle it) and 'detail' (one neutral sentence under 100 characters, phrased as what "
+        "sources report, e.g. 'Sources report that ...'; no accusations about named individuals). "
+        "No markdown or text outside the JSON."
     )
     try:
-        data = parse_validation_response(_generate(prompt, 1024, tally, search=True, timeout=15) or "")
-        status = data.get("status")
-        if status not in ("SUPPORTED", "REFUTED", "INCONCLUSIVE"):
-            status = "INCONCLUSIVE"
-        return status, str(data.get("detail", ""))[:120]
+        data = parse_validation_response(_generate(prompt, 1024, tally, search=True, timeout=20) or "")
+        items = data if isinstance(data, list) else data.get("results")
+        if not isinstance(items, list):
+            items = [data]  # tolerate a single bare object
+        results = []
+        for i in range(len(claims)):
+            item = items[i] if i < len(items) and isinstance(items[i], dict) else {}
+            status = item.get("status")
+            if status not in ("SUPPORTED", "REFUTED", "INCONCLUSIVE"):
+                status = "INCONCLUSIVE"
+            results.append((status, str(item.get("detail", ""))[:120]))
+        return results
     except Exception as exc:  # includes HTTP errors: a failed live check must never break a scan
         print("[ScrollSensay] live check failed:", exc)
-        return "INCONCLUSIVE", ""
+        return unknown
 
 
 # -------------------------------------------------------------------- scan
@@ -250,18 +269,35 @@ def analyze_text(text: str) -> dict:
     score = float(parsed["score"])
     explanation = [str(p) for p in parsed["explanation"]]
 
-    # Stage 2 (only when Stage 1 flagged one central claim it can't confirm): live search.
-    claim = str(parsed.get("verification_claim") or "").strip()
+    # Stage 2: live search for up to TWO claims in ONE call. "weak point" = the claim Stage 1 can't
+    # confirm that matters most; "clash" = a claim that conflicts with its memory. Out-of-date
+    # knowledge feels like certainty, so a clash is checked rather than criticised.
+    flagged = parsed.get("needs_verification") in (True, "true", "True")
+    weak = str(parsed.get("verification_claim") or "").strip() if flagged else ""
+    clash = str(parsed.get("clash_claim") or "").strip()
+    if _same_claim(clash, weak):
+        clash = ""
+    slots = []  # (label, explanation point to replace, claim)
+    if weak:
+        slots.append(("weak point", 2, weak))
+    if clash:
+        slots.append(("clash", 1, clash))
+
     check = "none"
-    if parsed.get("needs_verification") in (True, "true", "True") and claim:
-        check, detail = _live_check(claim, tally)
-        if check == "REFUTED":
-            score = min(score, 0.3)  # a verified-false central claim shows as red
-            explanation[-1] = f"Checked live: {detail or 'sources did not support this claim.'}"[:140]
-        elif check == "SUPPORTED":
-            if 0.4 <= score < 0.7:   # nudge borderline amber only; never rescue a weak text
-                score = min(0.7, score + 0.15)
-            explanation[-1] = f"Checked live: {detail or 'sources support this claim.'}"[:140]
+    if slots:
+        results = _live_check([claim for _, _, claim in slots], tally)
+        verdicts = []
+        for (label, point, _), (status, detail) in zip(slots, results):
+            verdicts.append(f"{label}: {status}")
+            if status in ("SUPPORTED", "REFUTED"):
+                fallback = "sources support this claim." if status == "SUPPORTED" else "sources did not support this claim."
+                explanation[min(point, len(explanation) - 1)] = f"Checked live: {detail or fallback}"[:140]
+        check = ", ".join(verdicts)
+        statuses = [status for status, _ in results]
+        if "REFUTED" in statuses:
+            score = min(score, 0.3)  # a verified-false claim shows as red, however well the rest is written
+        elif "SUPPORTED" in statuses and 0.4 <= score < 0.7:
+            score = min(0.7, score + 0.15)  # nudge borderline amber only; never rescue a weak text
 
     level = "green" if score >= 0.7 else "amber" if score >= 0.4 else "red"
     with _lock:
