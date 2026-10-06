@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 from dotenv import load_dotenv
-import copy
 import json
 import os
 import threading
@@ -21,11 +20,7 @@ class VerifyResponse(BaseModel):
     score: float
     explanation: List[str]
 
-app = FastAPI(
-    title="Text Authenticity Checker",
-    description="Backend service to classify text authenticity as red, amber, or green.",
-    version="0.1.0",
-)
+app = FastAPI(title="ScrollSensay API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,52 +29,50 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# ---------------------------------------------------------------- settings
+# Only VERIFY_MODEL and GOOGLE_API_KEY are needed. The rest are optional .env overrides.
 MODEL_NAME = os.getenv("VERIFY_MODEL", "gemini-3.6-flash")
-print("Using model:", MODEL_NAME)
+GROUNDING_ENABLED = os.getenv("GROUNDING_ENABLED", "true").lower() == "true"  # "false" = never search
+MAX_SCANS_PER_HOUR = int(os.getenv("MAX_SCANS_PER_HOUR", "600"))       # spend ceiling (0 = no limit)
+MAX_SEARCHES_PER_HOUR = int(os.getenv("MAX_SEARCHES_PER_HOUR", "60"))  # search ceiling (0 = no limit)
 
-# --- Search grounding (Stage 2) controls — all optional, set in .env ---
-# GROUNDING_ENABLED: "false" turns Stage 2 off entirely (Stage 1 behaves as before).
-# GROUNDING_SCOPE:   "broad" (default) also checks central claims the model doesn't
-#                    recognise; "narrow" only checks current-role/recent-result claims
-#                    and breaking announcements. Narrow = fewer searches.
-# GROUNDING_MAX_PER_HOUR: safety cap on grounded searches per hour, to stop a
-#                    runaway loop or a very busy session from spending unexpectedly.
-GROUNDING_ENABLED = os.getenv("GROUNDING_ENABLED", "true").lower() == "true"
-GROUNDING_SCOPE = os.getenv("GROUNDING_SCOPE", "broad").lower()
-GROUNDING_MAX_PER_HOUR = int(os.getenv("GROUNDING_MAX_PER_HOUR", "60"))
-CLAIM_CACHE_TTL = 6 * 60 * 60  # reuse a checked claim's result for 6 hours
-CLAIM_CACHE_MAX = 200
+# Hidden "thinking" is billed as output and shares the maxOutputTokens budget, so keep it low.
+THINKING_LEVEL = "low"  # minimal | low | medium | high
 
-# THINKING_LEVEL: how much hidden "thinking" Gemini does before answering.
-# Thinking tokens are billed as OUTPUT tokens and also count toward maxOutputTokens,
-# so a high level costs more and can cut the visible answer off mid-JSON.
-# Values: minimal | low (default) | medium | high | default (let Google decide).
-THINKING_LEVEL = os.getenv("THINKING_LEVEL", "low").lower()
-_thinking_supported = True  # flips to False if the API rejects thinkingConfig
+# Estimate only (USD per token, Gemini 3.x Flash through 31 Dec 2026) — for the cost shown in the log.
+PRICE_IN, PRICE_OUT, USD_TO_GBP = 0.75 / 1e6, 3.75 / 1e6, 0.75
 
-print(f"Grounding: enabled={GROUNDING_ENABLED}, scope={GROUNDING_SCOPE}, max/hour={GROUNDING_MAX_PER_HOUR}")
-print(f"Thinking level: {THINKING_LEVEL}")
+print(f"Model: {MODEL_NAME} | grounding: {GROUNDING_ENABLED} | limits/hour: "
+      f"{MAX_SCANS_PER_HOUR} scans, {MAX_SEARCHES_PER_HOUR} searches")
 
-_state_lock = threading.Lock()
-_claim_cache = {}          # normalised claim -> (timestamp, result)
-_grounded_call_times = []  # timestamps of grounded searches in the last hour
-_stats = {"scans": 0, "flagged": 0, "grounded": 0, "cache_hits": 0, "capped": 0}
+_lock = threading.Lock()
+_recent = {"scan": [], "search": []}  # timestamps in the last hour, for the two limits
+_session_usd = 0.0                    # running cost estimate since the server started
 
 
+def _within_limit(kind: str, limit: int) -> bool:
+    """True (and records it) if fewer than `limit` of this kind happened in the last hour."""
+    if limit <= 0:
+        return True
+    now = time.time()
+    with _lock:
+        _recent[kind] = [t for t in _recent[kind] if now - t < 3600]
+        if len(_recent[kind]) >= limit:
+            return False
+        _recent[kind].append(now)
+        return True
+
+
+# ------------------------------------------------------------------ prompt
 def build_validation_prompt(text: str) -> str:
     today = date.today().strftime("%d %B %Y")
-    triggers = (
-        "(a) someone's current role/status or a recent result (election, appointment, resignation); "
-        "(b) a breaking major announcement (a death, disaster, or major event)"
-    )
-    if GROUNDING_SCOPE != "narrow":
-        triggers += "; or (c) a central factual claim you don't recognise that the text's credibility depends on"
     return (
         "You are ScrollSensay: an educational caution tool, not a fact-checking oracle. You never "
         "assert a claim is definitely true or false — you help readers judge how much confidence to "
         f"place in what they're reading. Today's real date is {today}. Return ONLY JSON with fields "
         "'score', 'explanation', 'needs_verification' (true/false) and 'verification_claim' (the one "
-        "claim to check, as a short self-contained statement, if needs_verification is true; else \"\").\n\n"
+        "claim to check, as a short self-contained statement in plain minimal form — no titles, ages or "
+        "extra detail, e.g. \"Jane Doe is the CEO of Acme\" — if needs_verification is true; else \"\").\n\n"
         "Identify what the text is (factual claim, opinion/interview, mix, promotional) and judge it "
         "fairly for that type — a subjective opinion isn't 'misleading' unless presented as fact. Stay "
         "neutral on political/ideological content: judge evidence and framing, never which side you "
@@ -94,15 +87,16 @@ def build_validation_prompt(text: str) -> str:
         "unusual payment methods, a mismatched sender or link) lower confidence; a routine, expected ask "
         "(checkout, login, donation) is not a warning sign by itself. Not recognising something (e.g. an "
         "indie film or small organisation) isn't evidence it's false — don't lower the score for it.\n\n"
-        "Your knowledge has a cutoff, so never call a claim wrong, false or an 'error' just because it "
-        "conflicts with your memory — say it differs from what you know and may have changed. Set "
-        "needs_verification to true ONLY when the text's main point rests on one specific claim you "
-        "cannot confirm that may have changed or happened after your "
-        f"cutoff: {triggers}. Choose the single most central claim; never use this for opinions, "
-        "minor details, or well-known historical facts. When true, make explanation point 3 a neutral "
-        "note that this claim is worth checking, and do not lower the score for it. Treat completed, "
-        "historical, time-stamped events with normal confidence. For ages or date maths, calculate "
-        "against today's date, checking whether a birthday has passed this year.\n\n"
+        "Your knowledge has a cutoff: a clash with your memory is NOT evidence, so never mention one in "
+        "the explanation or let it lower the score (noting what matches your knowledge is fine). Set "
+        "needs_verification to true ONLY when one specific, checkable claim that you cannot confirm from "
+        "your own knowledge materially affects how far to trust the text (it may have changed or "
+        "happened after your cutoff, or it clashes with your memory) — on any topic. If several "
+        "qualify, choose the one that matters most; never use this for opinions, minor details, or "
+        "well-known historical facts. When true, make explanation point 3 a neutral note that this "
+        "claim is worth checking, and do not lower the score for it. Treat completed, historical, "
+        "time-stamped events with normal confidence. For ages or date maths, calculate against "
+        "today's date, checking whether a birthday has passed this year.\n\n"
         "score (0.0-1.0):\n"
         "0.7-1.0 = well-supported by evidence in the text, no notable concerns\n"
         "0.4-0.69 = a genuine mix — some solid points, some unverified or missing context\n"
@@ -116,17 +110,16 @@ def build_validation_prompt(text: str) -> str:
         "Text:\n---BEGIN TEXT---\n" + text + "\n---END TEXT---"
     )
 
+
 def parse_validation_response(response_text: str) -> dict:
     text = response_text.strip()
-    # Strip markdown code fences
-    if text.startswith("```"):
+    if text.startswith("```"):  # strip markdown code fences
         text = text.split("\n", 1)[-1]
         text = text.rsplit("```", 1)[0].strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
+        start, end = text.find("{"), text.rfind("}")
         if start != -1 and end != -1 and start < end:
             try:
                 return json.loads(text[start : end + 1])
@@ -135,120 +128,26 @@ def parse_validation_response(response_text: str) -> dict:
         raise ValueError("Unable to parse JSON from model response.")
 
 
-def _gemini_post(payload: dict, api_key: str, timeout: int):
-    """POST to Gemini, adding the thinking setting. If the API rejects the
-    thinking setting (e.g. a model that doesn't support that level), retry once
-    without it and stop sending it, rather than breaking every request."""
-    global _thinking_supported
+# ------------------------------------------------------------ Gemini calls
+def _generate(prompt: str, max_tokens: int, tally: dict, search: bool = False, timeout: int = 30):
+    """One Gemini call. Returns the reply text (None if there was no visible answer).
+    Raises HTTPException for HTTP-level problems; a 429 keeps its Retry-After."""
+    global _session_usd
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": max_tokens,
+            "thinkingConfig": {"thinkingLevel": THINKING_LEVEL},
+        },
+    }
+    if search:
+        payload["tools"] = [{"google_search": {}}]
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
-    headers = {"X-goog-api-key": api_key, "Content-Type": "application/json"}
+    headers = {"X-goog-api-key": os.getenv("GOOGLE_API_KEY", ""), "Content-Type": "application/json"}
 
-    use_thinking = _thinking_supported and THINKING_LEVEL not in ("", "default", "off")
-    body = copy.deepcopy(payload)
-    if use_thinking:
-        body.setdefault("generationConfig", {})["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
-
-    resp = requests.post(url, json=body, timeout=timeout, headers=headers)
-
-    if use_thinking and resp.status_code == 400 and "thinking" in (resp.text or "").lower():
-        print("[ScrollSensay] thinkingConfig rejected by the API — retrying without it:", resp.text[:200])
-        _thinking_supported = False
-        resp = requests.post(url, json=copy.deepcopy(payload), timeout=timeout, headers=headers)
-    return resp
-
-
-def _log_usage(label: str, data: dict) -> None:
-    """Print token usage so real cost per scan (including hidden thinking tokens) is visible."""
     try:
-        usage = data.get("usageMetadata", {}) or {}
-        finish = data["candidates"][0].get("finishReason")
-        print(
-            f"[ScrollSensay] {label} usage: in={usage.get('promptTokenCount')} "
-            f"out={usage.get('candidatesTokenCount')} thinking={usage.get('thoughtsTokenCount')} finish={finish}"
-        )
-    except Exception:
-        pass
-
-
-def _claim_key(claim: str) -> str:
-    return " ".join(claim.lower().split())
-
-
-def verify_claim_with_search(claim: str, api_key: str) -> dict:
-    """Stage 2: check ONE flagged claim with live Google Search grounding.
-
-    Only runs for claims Stage 1 flags as needs_verification. Results are
-    cached by claim so the same claim (e.g. repeated through a live blog or
-    seen by several users) isn't searched again, and a per-hour cap stops
-    runaway usage. Any failure falls back to INCONCLUSIVE, which leaves
-    Stage 1's result untouched."""
-    inconclusive = {"status": "INCONCLUSIVE", "detail": ""}
-    if not GROUNDING_ENABLED:
-        return inconclusive
-
-    key = _claim_key(claim)
-    now = time.time()
-    with _state_lock:
-        cached = _claim_cache.get(key)
-        if cached and now - cached[0] < CLAIM_CACHE_TTL:
-            _stats["cache_hits"] += 1
-            return cached[1]
-        _grounded_call_times[:] = [t for t in _grounded_call_times if now - t < 3600]
-        if len(_grounded_call_times) >= GROUNDING_MAX_PER_HOUR:
-            _stats["capped"] += 1
-            return inconclusive
-        _grounded_call_times.append(now)
-        _stats["grounded"] += 1
-
-    today = date.today().strftime("%d %B %Y")
-    prompt = (
-        f"Today's real date is {today}. Using live search, check whether this specific claim is "
-        f'currently accurate: "{claim}"\n\n'
-        "Return ONLY JSON with fields 'status' (SUPPORTED, REFUTED, or INCONCLUSIVE — use "
-        "INCONCLUSIVE unless search results clearly settle it) and 'detail' (one neutral sentence "
-        "under 100 characters, phrased as what sources report, e.g. 'Sources report that ...'; no "
-        "accusations about named individuals). No markdown or text outside the JSON."
-    )
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
-    }
-    try:
-        resp = _gemini_post(payload, api_key, 15)
-        if not resp.ok:
-            print(f"[ScrollSensay] Stage 2 HTTP {resp.status_code}: {resp.text[:300]}")
-            return inconclusive
-        data = resp.json()
-        _log_usage("Stage 2", data)
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        print("[ScrollSensay] Stage 2 raw_text:", repr(raw_text))
-        parsed = parse_validation_response(raw_text)
-        status = parsed.get("status", "INCONCLUSIVE")
-        if status not in ("SUPPORTED", "REFUTED", "INCONCLUSIVE"):
-            status = "INCONCLUSIVE"
-        result = {"status": status, "detail": str(parsed.get("detail", ""))[:120]}
-    except Exception as exc:
-        # Stage 2 failing must never break the response — fall back to Stage 1.
-        print("[ScrollSensay] Stage 2 failed:", str(exc))
-        return inconclusive
-
-    with _state_lock:
-        if len(_claim_cache) >= CLAIM_CACHE_MAX:
-            _claim_cache.pop(next(iter(_claim_cache)))
-        _claim_cache[key] = (time.time(), result)
-    return result
-
-
-def _stage1_attempt(prompt: str, api_key: str, max_tokens: int):
-    """One Stage 1 call. Returns the parsed JSON dict, or None if the reply was
-    cut off, empty, or not in the expected shape (so the caller can retry)."""
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": max_tokens},
-    }
-    try:
-        resp = _gemini_post(payload, api_key, 30)
+        resp = requests.post(url, json=payload, timeout=timeout, headers=headers)
     except RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Request to Gemini failed: {exc}")
 
@@ -262,95 +161,122 @@ def _stage1_attempt(prompt: str, api_key: str, max_tokens: int):
         except Exception:
             pass
         raise HTTPException(status_code=429, detail="Rate limited by Gemini", headers={"Retry-After": str(retry_after)})
-
     if not resp.ok:
         raise HTTPException(status_code=502, detail=f"Gemini {resp.status_code}: {resp.text}")
 
     data = resp.json()
-    _log_usage("Stage 1", data)
+    usage = data.get("usageMetadata") or {}
+    cost = (usage.get("promptTokenCount") or 0) * PRICE_IN + (
+        (usage.get("candidatesTokenCount") or 0) + (usage.get("thoughtsTokenCount") or 0)) * PRICE_OUT
+    tally["usd"] += cost
+    with _lock:
+        _session_usd += cost
 
-    try:
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError):
-        return None  # no visible answer at all (e.g. thinking used the whole budget)
+    candidate = (data.get("candidates") or [{}])[0]
+    if candidate.get("finishReason") not in (None, "STOP"):
+        print(f"[ScrollSensay] Warning: Gemini reply ended with {candidate.get('finishReason')}")
+    parts = (candidate.get("content") or {}).get("parts") or []
+    return parts[0].get("text") if parts else None
 
-    print("[ScrollSensay] raw_text:", repr(raw_text))
-    try:
-        parsed = parse_validation_response(raw_text)
-    except ValueError:
-        return None  # cut off mid-JSON or otherwise unreadable
-    if not (isinstance(parsed, dict) and "score" in parsed and isinstance(parsed.get("explanation"), list)):
+
+def _parse_scan(reply):
+    """Stage 1 reply -> dict with a numeric score and a non-empty explanation list, else None."""
+    if not reply:
         return None
-    return parsed
+    try:
+        parsed = parse_validation_response(reply)
+    except ValueError:
+        return None
+    if (isinstance(parsed, dict) and isinstance(parsed.get("score"), (int, float))
+            and isinstance(parsed.get("explanation"), list) and parsed["explanation"]):
+        return parsed
+    return None
 
 
+def _live_check(claim: str, tally: dict):
+    """Stage 2: check ONE claim with live Google Search. Returns (status, detail).
+    Any problem (off, over the limit, error, unreadable) -> INCONCLUSIVE, so Stage 1's result stands."""
+    if not GROUNDING_ENABLED:
+        return "INCONCLUSIVE", ""
+    if not _within_limit("search", MAX_SEARCHES_PER_HOUR):
+        print("[ScrollSensay] search limit reached — skipping live check")
+        return "INCONCLUSIVE", ""
+    today = date.today().strftime("%d %B %Y")
+    prompt = (
+        f"Today's real date is {today}. Using live search, check whether this specific claim is "
+        f'currently accurate: "{claim}"\n\n'
+        "Return ONLY JSON with fields 'status' (SUPPORTED, REFUTED, or INCONCLUSIVE — use "
+        "INCONCLUSIVE unless search results clearly settle it) and 'detail' (one neutral sentence "
+        "under 100 characters, phrased as what sources report, e.g. 'Sources report that ...'; no "
+        "accusations about named individuals). No markdown or text outside the JSON."
+    )
+    try:
+        data = parse_validation_response(_generate(prompt, 1024, tally, search=True, timeout=15) or "")
+        status = data.get("status")
+        if status not in ("SUPPORTED", "REFUTED", "INCONCLUSIVE"):
+            status = "INCONCLUSIVE"
+        return status, str(data.get("detail", ""))[:120]
+    except Exception as exc:  # includes HTTP errors: a failed live check must never break a scan
+        print("[ScrollSensay] live check failed:", exc)
+        return "INCONCLUSIVE", ""
+
+
+# -------------------------------------------------------------------- scan
 def analyze_text(text: str) -> dict:
     if not text.strip():
         raise ValueError("Text must not be empty.")
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+    if not os.getenv("GOOGLE_API_KEY"):
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not set in environment")
+    if not _within_limit("scan", MAX_SCANS_PER_HOUR):
+        raise HTTPException(status_code=429, detail="Hourly scan limit reached", headers={"Retry-After": "60"})
 
     prompt = build_validation_prompt(text)
+    tally = {"usd": 0.0}
 
-    # maxOutputTokens is a combined budget for hidden thinking + the visible answer, so
-    # give generous headroom and retry once with more if the answer still gets cut off.
+    # Stage 1: the evaluation. Thinking shares the token budget with the answer, so if the
+    # reply is cut off or unreadable, try once more with more room.
     parsed = None
     for max_tokens in (4096, 8192):
-        parsed = _stage1_attempt(prompt, api_key, max_tokens)
-        if parsed is not None:
+        reply = _generate(prompt, max_tokens, tally)
+        print("[ScrollSensay] raw_text:", repr(reply))
+        parsed = _parse_scan(reply)
+        if parsed:
             break
-        print("[ScrollSensay] Stage 1 reply was cut off or unreadable — retrying with a larger budget")
-    if parsed is None:
-        # 502 (not 400) so the extension treats this as temporary and retries automatically.
+        print("[ScrollSensay] reply was cut off or unreadable — retrying with a larger budget")
+    if not parsed:
+        # 502 (not 400) so the extension treats this as temporary and retries by itself.
         raise HTTPException(status_code=502, detail="Model returned an unreadable response")
 
-    score = float(parsed.get("score", 0.5))
-    explanation = parsed["explanation"]
-    needs_verification = parsed.get("needs_verification") in (True, "true", "True")
-    verification_claim = str(parsed.get("verification_claim") or "").strip()
+    score = float(parsed["score"])
+    explanation = [str(p) for p in parsed["explanation"]]
 
-    with _state_lock:
-        _stats["scans"] += 1
-        if needs_verification and verification_claim:
-            _stats["flagged"] += 1
-
-    if needs_verification and verification_claim:
-        print("[ScrollSensay] Stage 2: verifying claim:", repr(verification_claim))
-        verification = verify_claim_with_search(verification_claim, api_key)
-        print("[ScrollSensay] Stage 2 result:", verification)
-        status = verification["status"]
-        note = verification["detail"]
-
-        if status == "REFUTED":
-            # A verified-false central claim should show as red, however well the rest is written.
-            score = min(score, 0.3)
-            explanation = list(explanation) or [""]
-            explanation[-1] = f"Checked live: {note or 'sources did not support this claim.'}"[:140]
-        elif status == "SUPPORTED":
-            # Only nudge borderline amber results — undoes any leaked "unfamiliar" penalty
-            # without letting one true detail rescue a text that is weak in other ways.
-            if 0.4 <= score < 0.7:
+    # Stage 2 (only when Stage 1 flagged one central claim it can't confirm): live search.
+    claim = str(parsed.get("verification_claim") or "").strip()
+    check = "none"
+    if parsed.get("needs_verification") in (True, "true", "True") and claim:
+        check, detail = _live_check(claim, tally)
+        if check == "REFUTED":
+            score = min(score, 0.3)  # a verified-false central claim shows as red
+            explanation[-1] = f"Checked live: {detail or 'sources did not support this claim.'}"[:140]
+        elif check == "SUPPORTED":
+            if 0.4 <= score < 0.7:   # nudge borderline amber only; never rescue a weak text
                 score = min(0.7, score + 0.15)
-            explanation = list(explanation) or [""]
-            explanation[-1] = f"Checked live: {note or 'sources support this claim.'}"[:140]
-        # INCONCLUSIVE / capped / failed: keep Stage 1's score and neutral "worth checking" note.
+            explanation[-1] = f"Checked live: {detail or 'sources support this claim.'}"[:140]
 
-    with _state_lock:
-        print("[ScrollSensay] stats:", dict(_stats))
+    level = "green" if score >= 0.7 else "amber" if score >= 0.4 else "red"
+    with _lock:
+        session = _session_usd
+    print(f"[ScrollSensay] SCAN {level} {score:.2f} | live check: {check} | "
+          f"this scan ~{tally['usd'] * USD_TO_GBP * 100:.2f}p | session ~£{session * USD_TO_GBP:.3f}")
 
-    return {
-        "score": score,
-        "explanation": explanation,
-    }
+    return {"score": score, "explanation": explanation}
 
 
 @app.post("/api/verify", response_model=VerifyResponse)
 def verify(request: VerifyRequest):
-    # Plain `def` (not `async def`) so FastAPI runs this in a worker thread; the
-    # blocking network calls above then don't freeze other users' requests.
+    # Plain `def` (not `async def`): FastAPI runs it in a worker thread, so one slow Gemini
+    # call doesn't freeze other users' requests.
     try:
-        result = analyze_text(request.text)
+        return analyze_text(request.text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return result
