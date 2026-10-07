@@ -1,5 +1,4 @@
 const SCROLL_DEBOUNCE = 3000;
-const API_ENDPOINT = 'http://localhost:8000/api/verify';
 
 let enabled = false;
 let lastViewportText = '';
@@ -144,6 +143,51 @@ chrome.storage.onChanged.addListener((c) => {
   }
 });
 
+// --- Detect in-page (SPA-style) navigation ---
+// Many news sites swap article content via JavaScript without a full page
+// reload, so the content script never gets freshly re-injected. Without
+// this, the extension can appear "stuck" on the previous article until a
+// manual refresh. We watch for URL changes via pushState/replaceState
+// (used by most client-side routers) and browser back/forward (popstate),
+// reset per-page state, and re-run the same ready-check scan used on load.
+
+// A "page" is the address without the #hash. Live blogs and long articles often change the
+// #hash as you scroll to a post; that's the same page, so it must NOT reset state and rescan.
+function pageKey() {
+  return location.origin + location.pathname + location.search;
+}
+
+let lastKnownUrl = pageKey();
+
+function handlePossibleNavigation() {
+  const key = pageKey();
+  if (key === lastKnownUrl) return;
+  lastKnownUrl = key;
+
+  // Reset state so the new page's content isn't compared against the
+  // previous page's last-scanned text or shown result.
+  lastViewportText = '';
+  lastResult = { label: null, explanation: [] };
+  setIndicator(null);
+  if (panelOpen) buildPanel();
+
+  attemptScanUntilReady();
+}
+
+const _pushState = history.pushState;
+history.pushState = function (...args) {
+  _pushState.apply(this, args);
+  handlePossibleNavigation();
+};
+
+const _replaceState = history.replaceState;
+history.replaceState = function (...args) {
+  _replaceState.apply(this, args);
+  handlePossibleNavigation();
+};
+
+window.addEventListener('popstate', handlePossibleNavigation);
+
 // --- API ---
 
 const TEXT_CACHE_MAX = 50;
@@ -169,45 +213,46 @@ function saveCacheToSession() {
 
 const textCache = loadCacheFromSession();
 
-async function callAPI(text, retries = 3) {
+// Requests currently in flight, keyed by the exact text being checked. The cache above
+// only fills once a reply comes back, so without this, two triggers firing close together
+// (page load + navigation, or a scroll + a retry) both miss the cache and send duplicate
+// requests for the same screen. Now the second caller simply waits for the first one's answer.
+const pendingScans = new Map();
+
+async function callAPI(text) {
   if (textCache.has(text)) return textCache.get(text);
+  if (pendingScans.has(text)) return pendingScans.get(text);
 
-  const res = await fetch(API_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  });
+  const request = (async () => {
+    // Sent to background.js, which does the actual fetch (and retries) from
+    // its own context — not subject to the host page's Content-Security-Policy
+    // the way a content script's own fetch() call can be.
+    const data = await chrome.runtime.sendMessage({ type: 'VERIFY', text });
 
-  if (res.status === 429) {
-    if (retries <= 0) return null;
-    const retryAfter = parseInt(res.headers.get('Retry-After') || '60', 10);
-    await new Promise(r => setTimeout(r, retryAfter * 1000));
-    return callAPI(text, retries - 1);
+    if (!data || data.error) {
+      throw new Error(data && data.error ? data.error : 'No response from background script');
+    }
+
+    const score = typeof data.score === 'number' ? data.score : 0.5;
+    const result = {
+      label: score >= 0.7 ? 'green' : score >= 0.4 ? 'amber' : 'red',
+      explanation: Array.isArray(data.explanation) ? data.explanation : [data.explanation || ''],
+    };
+
+    if (textCache.size >= TEXT_CACHE_MAX) {
+      textCache.delete(textCache.keys().next().value);
+    }
+    textCache.set(text, result);
+    saveCacheToSession();
+    return result;
+  })();
+
+  pendingScans.set(text, request);
+  try {
+    return await request;
+  } finally {
+    pendingScans.delete(text);
   }
-
-  // Transient upstream failure (e.g. Gemini temporarily overloaded) — retry
-  // automatically after a short wait instead of leaving the indicator stuck.
-  if (res.status === 502 || res.status === 503) {
-    if (retries <= 0) return null;
-    await new Promise(r => setTimeout(r, 4000));
-    return callAPI(text, retries - 1);
-  }
-
-  if (!res.ok) throw new Error(`API ${res.status}`);
-  const data = await res.json();
-
-  const score = typeof data.score === 'number' ? data.score : 0.5;
-  const result = {
-    label: score >= 0.7 ? 'green' : score >= 0.4 ? 'amber' : 'red',
-    explanation: Array.isArray(data.explanation) ? data.explanation : [data.explanation || ''],
-  };
-
-  if (textCache.size >= TEXT_CACHE_MAX) {
-    textCache.delete(textCache.keys().next().value);
-  }
-  textCache.set(text, result);
-  saveCacheToSession();
-  return result;
 }
 
 // --- Viewport scan ---
@@ -254,6 +299,11 @@ function getViewportText() {
   return [...new Set(parts)].join(' ').slice(0, 3000);
 }
 
+// Guards against a stale/older response overwriting a newer, correct one
+// when two scans happen to be in flight close together (e.g. the retry-on-
+// load scan and a scroll-triggered scan overlapping).
+let scanRequestId = 0;
+
 async function updateIndicator() {
   if (!enabled) return; // hard gate: no scan, no API call, no cost, while inactive
   const text = getViewportText();
@@ -261,9 +311,13 @@ async function updateIndicator() {
   if (text === lastViewportText) return;
   if (lastViewportText && text.slice(0, 500) === lastViewportText.slice(0, 500)) return;
 
+  const thisRequestId = ++scanRequestId;
+
   try {
     const result = await callAPI(text);
-    if (result) {
+    // Only apply this result if no newer scan has started since — otherwise
+    // an older, slower response could overwrite a correct, newer one.
+    if (result && thisRequestId === scanRequestId) {
       lastViewportText = text;
       lastResult = result;
       setIndicator(result.label);
