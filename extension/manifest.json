@@ -2,6 +2,11 @@
   "manifest_version": 3,
   "name": "ScrollSensay",
   "version": "1.0.0",
+  "icons": {
+    "16": "scrollsensay-icon.png",
+    "48": "scrollsensay-icon.png",
+    "128": "scrollsensay-icon.png"
+  },
   "description": "Chrome browser extension that uses AI to detect misinformation as you scroll.",
   "permissions": ["storage"],
   "host_permissions": [
@@ -20,6 +25,11 @@
     "service_worker": "background.js"
   },
   "action": {
+    "default_icon": {
+      "16": "scrollsensay-icon.png",
+      "48": "scrollsensay-icon.png",
+      "128": "scrollsensay-icon.png"
+    },
     "default_popup": "popup.html",
     "default_title": "ScrollSensay"
   },
