@@ -11,7 +11,9 @@
   "permissions": ["storage"],
   "host_permissions": [
     "https://*/*",
-    "http://*/*"
+    "http://*/*",
+    "http://localhost:8000/*",
+    "https://scroll-sensay.onrender.com/*"
   ],
   "content_scripts": [
     {

@@ -8,7 +8,18 @@
 // through here avoids that entirely — this is why content.js now sends a
 // message here instead of calling fetch() directly.
 
-const API_ENDPOINT = 'http://localhost:8000/api/verify';
+const USE_LOCAL_BACKEND = false;
+
+// Local development
+const LOCAL_API_ENDPOINT = 'http://localhost:8000/api/verify';
+
+// Online backend
+const ONLINE_API_ENDPOINT = 'https://scroll-sensay.onrender.com/api/verify';
+
+// Select which backend to use
+const API_ENDPOINT = USE_LOCAL_BACKEND
+  ? LOCAL_API_ENDPOINT
+  : ONLINE_API_ENDPOINT;
 
 async function verifyWithRetry(text, retries = 3) {
   const res = await fetch(API_ENDPOINT, {
