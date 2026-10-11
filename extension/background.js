@@ -8,18 +8,25 @@
 // through here avoids that entirely — this is why content.js now sends a
 // message here instead of calling fetch() directly.
 
-const USE_LOCAL_BACKEND = false;
-
-// Local development
 const LOCAL_API_ENDPOINT = 'http://localhost:8000/api/verify';
 
-// Online backend
 const ONLINE_API_ENDPOINT = 'https://scroll-sensay.onrender.com/api/verify';
 
-// Select which backend to use
+// Load your private local setting if it exists.
+// If it doesn't exist, use Render.
+try {
+  importScripts('backend-config.local.js');
+} catch (error) {
+  // No local config file: use the online backend.
+}
+
+const USE_LOCAL_BACKEND =
+  globalThis.SCROLLSENSAY_USE_LOCAL_BACKEND === true;
+
 const API_ENDPOINT = USE_LOCAL_BACKEND
   ? LOCAL_API_ENDPOINT
   : ONLINE_API_ENDPOINT;
+
 
 async function verifyWithRetry(text, retries = 3) {
   const res = await fetch(API_ENDPOINT, {
