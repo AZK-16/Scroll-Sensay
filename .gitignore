@@ -6,4 +6,3 @@ env/
 venv/
 .env
 .DS_Store
-extension/backend-config.local.js
