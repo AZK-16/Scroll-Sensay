@@ -1,5 +1,10 @@
 const SCROLL_DEBOUNCE = 3000;
 
+// Which copy of this file is running? Printed in the page console (F12) on every load,
+// so an old or wrong copy of content.js is obvious in seconds.
+const BUILD = 'a11y-merge-2';
+console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
+
 let enabled = false;
 let lastViewportText = '';
 let lastResult = { label: null, explanation: [] };
@@ -17,6 +22,7 @@ indicator.type = 'button';
 indicator.setAttribute('aria-haspopup', 'dialog');
 indicator.setAttribute('aria-expanded', 'false');
 indicator.setAttribute('aria-controls', 'hh-panel');
+indicator.setAttribute('aria-keyshortcuts', 'Alt+Shift+S');
 const indicatorEmoji = document.createElement('span');
 indicatorEmoji.setAttribute('aria-hidden', 'true');
 indicatorEmoji.textContent = '😊';
@@ -114,7 +120,13 @@ function pickVoice() {
     const v = voices.find(v => v.name === name);
     if (v) return v;
   }
-  return voices.find(v => v.lang === 'en-GB') || voices.find(v => v.lang.startsWith('en')) || null;
+  // Basic system voices sound robotic. Higher-quality ones (macOS "Premium"/"Enhanced", Microsoft "Natural")
+  // sound much better, so prefer those among the British voices before settling for the first one.
+  const british = voices.filter(v => v.lang === 'en-GB' || v.lang === 'en_GB');
+  return british.find(v => /premium|enhanced|natural/i.test(v.name))
+    || british[0]
+    || voices.find(v => (v.lang || '').startsWith('en'))
+    || null;
 }
 
 function speakResult() {
@@ -172,6 +184,17 @@ indicator.addEventListener('click', (e) => {
 
 document.addEventListener('click', (e) => {
   if (panelOpen && !panel.contains(e.target)) hidePanel();
+});
+
+// Keyboard shortcut: Alt+Shift+S (Option+Shift+S on a Mac) opens or closes the advice from anywhere.
+// The button sits at the END of the page's Tab order, so without this a keyboard user would have to
+// Tab through every link on the page first. It is ignored while typing in a text field.
+document.addEventListener('keydown', (e) => {
+  if (!enabled || !e.altKey || !e.shiftKey || e.code !== 'KeyS') return;
+  const t = e.target;
+  if (t && t.closest && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+  e.preventDefault();
+  panelOpen ? hidePanel(true) : showPanel();
 });
 
 // --- Enabled state (storage-driven, live-updating, opt-in by default) ---
