@@ -4,26 +4,54 @@ let enabled = false;
 let lastViewportText = '';
 let lastResult = { label: null, explanation: [] };
 let panelOpen = false;
+let pageEpoch = 0; // bumps whenever the user moves to a different page
 
 // --- Indicator dot ---
 
-const indicator = document.createElement('div');
+// A real <button>, so it can be reached with Tab and pressed with Enter or Space,
+// and screen readers announce it. The emoji itself is hidden from screen readers;
+// the button's aria-label says what it means in words instead.
+const indicator = document.createElement('button');
 indicator.id = 'hh-indicator';
-indicator.textContent = '😊';
+indicator.type = 'button';
+indicator.setAttribute('aria-haspopup', 'dialog');
+indicator.setAttribute('aria-expanded', 'false');
+indicator.setAttribute('aria-controls', 'hh-panel');
+const indicatorEmoji = document.createElement('span');
+indicatorEmoji.setAttribute('aria-hidden', 'true');
+indicatorEmoji.textContent = '😊';
+indicator.appendChild(indicatorEmoji);
 document.body.appendChild(indicator);
+
+const SIGNAL_WORDS = {
+  green: 'No concerns found',
+  amber: 'Worth a second look',
+  red: 'Some concerns here',
+  unavailable: "Couldn't check this just now",
+};
+
+function setIndicatorLabel(label) {
+  const words = SIGNAL_WORDS[label] || 'Still scanning';
+  indicator.setAttribute('aria-label', 'ScrollSensay: ' + words + '. Open advice');
+}
+setIndicatorLabel(null);
 
 function setIndicator(label) {
   indicator.classList.remove('hh-green', 'hh-amber', 'hh-red');
-  if (label === 'green')      { indicator.classList.add('hh-green'); indicator.textContent = '😊'; }
-  else if (label === 'amber') { indicator.classList.add('hh-amber'); indicator.textContent = '🤔'; }
-  else if (label === 'red')   { indicator.classList.add('hh-red');   indicator.textContent = '😧'; }
-  else                        {                                       indicator.textContent = '😊'; }
+  if (label === 'green')      { indicator.classList.add('hh-green'); indicatorEmoji.textContent = '😊'; }
+  else if (label === 'amber') { indicator.classList.add('hh-amber'); indicatorEmoji.textContent = '🤔'; }
+  else if (label === 'red')   { indicator.classList.add('hh-red');   indicatorEmoji.textContent = '😧'; }
+  else                        {                                       indicatorEmoji.textContent = '😊'; }
+  setIndicatorLabel(label);
 }
 
 // --- Reasons panel ---
 
 const panel = document.createElement('div');
 panel.id = 'hh-panel';
+panel.setAttribute('role', 'dialog');
+panel.setAttribute('aria-label', "Sensay's advice");
+panel.tabIndex = -1; // lets the panel take focus when it opens
 document.body.appendChild(panel);
 
 function buildPanel() {
@@ -37,15 +65,18 @@ function buildPanel() {
   const title = document.createElement('div');
   title.className = 'hh-panel-title';
   title.textContent = lastResult.label === null ? "Sensay's Advice:\nStill scanning…"
+    : lastResult.label === 'unavailable' ? "Sensay's Advice:\nCouldn't check this just now"
     : lastResult.label === 'green' ? "Sensay's Advice:\nNo concerns found"
-    : "Sensay's Advice:\nWorth a closer look";
+    : lastResult.label === 'amber' ? "Sensay's Advice:\nWorth a second look"
+    : "Sensay's Advice:\nSome concerns here";
   title.style.whiteSpace = 'pre-line';
   titleWrap.appendChild(title);
   header.appendChild(titleWrap);
 
   const audio = document.createElement('button');
   audio.className = 'hh-panel-audio';
-  audio.innerHTML = '<img src="' + chrome.runtime.getURL('icons/audio-icon.svg') + '" width="18" height="18" alt="Read aloud" />';
+  audio.type = 'button';
+  audio.innerHTML = '<img src="' + chrome.runtime.getURL('icons/audio-icon.svg') + '" width="18" height="18" alt="" />';
   audio.setAttribute('aria-label', 'Read aloud');
   audio.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -71,6 +102,21 @@ function buildPanel() {
   }
 }
 
+function pickVoice() {
+  const voices = speechSynthesis.getVoices();
+  const preferred = [
+    'Google UK English Female',
+    'Microsoft Sonia Online (Natural) - English (United Kingdom)',
+    'Microsoft Libby Online (Natural) - English (United Kingdom)',
+    'Google UK English Male',
+  ];
+  for (const name of preferred) {
+    const v = voices.find(v => v.name === name);
+    if (v) return v;
+  }
+  return voices.find(v => v.lang === 'en-GB') || voices.find(v => v.lang.startsWith('en')) || null;
+}
+
 function speakResult() {
   if (!window.speechSynthesis) return;
   if (speechSynthesis.speaking) {
@@ -81,19 +127,43 @@ function speakResult() {
     typeof p === 'object' ? (p.body || '') : String(p)
   );
   const u = new SpeechSynthesisUtterance(parts.join('. '));
+  const voice = pickVoice();
+  if (voice) u.voice = voice;
+  u.lang = 'en-GB';
+  u.rate = 0.95;
   speechSynthesis.speak(u);
+}
+
+// Chrome loads its voice list a moment after the page opens; asking for it
+// early makes sure the nicer voices are ready by the first click.
+if (window.speechSynthesis) {
+  speechSynthesis.getVoices();
+  speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
 }
 
 function showPanel() {
   buildPanel();
   panel.classList.add('hh-open');
   panelOpen = true;
+  indicator.setAttribute('aria-expanded', 'true');
+  panel.focus(); // move keyboard and screen-reader focus into the advice
 }
 
-function hidePanel() {
+function hidePanel(returnFocus) {
+  const hadFocus = panel.contains(document.activeElement);
   panel.classList.remove('hh-open');
   panelOpen = false;
+  indicator.setAttribute('aria-expanded', 'false');
+  if (returnFocus || hadFocus) indicator.focus(); // don't strand keyboard users
 }
+
+// Escape closes the advice and puts focus back on the ScrollSensay button.
+panel.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.stopPropagation();
+    hidePanel(true);
+  }
+});
 
 indicator.addEventListener('click', (e) => {
   e.stopPropagation();
@@ -168,6 +238,7 @@ function handlePossibleNavigation() {
   // previous page's last-scanned text or shown result.
   lastViewportText = '';
   lastResult = { label: null, explanation: [] };
+  pageEpoch++; // replies still in flight belong to the previous page, so they won't be shown
   setIndicator(null);
   if (panelOpen) buildPanel();
 
@@ -302,7 +373,19 @@ function getViewportText() {
 // Guards against a stale/older response overwriting a newer, correct one
 // when two scans happen to be in flight close together (e.g. the retry-on-
 // load scan and a scroll-triggered scan overlapping).
+// Each scan gets a number. A reply is shown unless a NEWER scan's reply has already been shown
+// (so a slow, older reply can't overwrite a newer one). Crucially, an older reply is still shown
+// if the newer scan hasn't finished or has failed — the user is never left with nothing.
 let scanRequestId = 0;
+let lastShownRequestId = 0;
+
+function showUnavailableIfEmpty() {
+  // Only when nothing is on display yet; never replace a good result with an error.
+  if (lastResult.label !== null) return;
+  lastResult = { label: 'unavailable', explanation: ["Couldn't check this just now. It will try again when you scroll."] };
+  setIndicator('unavailable'); // neutral grey face, and screen readers hear the same words as the panel
+  if (panelOpen) buildPanel();
+}
 
 async function updateIndicator() {
   if (!enabled) return; // hard gate: no scan, no API call, no cost, while inactive
@@ -312,12 +395,13 @@ async function updateIndicator() {
   if (lastViewportText && text.slice(0, 500) === lastViewportText.slice(0, 500)) return;
 
   const thisRequestId = ++scanRequestId;
+  const epoch = pageEpoch;
 
   try {
     const result = await callAPI(text);
-    // Only apply this result if no newer scan has started since — otherwise
-    // an older, slower response could overwrite a correct, newer one.
-    if (result && thisRequestId === scanRequestId) {
+    // Show it unless the user has since moved to a different page, or a newer scan already showed.
+    if (result && epoch === pageEpoch && thisRequestId > lastShownRequestId) {
+      lastShownRequestId = thisRequestId;
       lastViewportText = text;
       lastResult = result;
       setIndicator(result.label);
@@ -325,6 +409,7 @@ async function updateIndicator() {
     }
   } catch (err) {
     console.warn('[ScrollSensay]', err.message);
+    if (epoch === pageEpoch) showUnavailableIfEmpty();
   }
 }
 

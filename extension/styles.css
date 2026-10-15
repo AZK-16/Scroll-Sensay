@@ -16,6 +16,18 @@
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0,0,0,0.3);
   user-select: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
+}
+
+/* 1. A clear outline when the button is reached with the keyboard */
+#hh-indicator:focus-visible,
+.hh-panel-audio:focus-visible,
+#hh-panel:focus-visible {
+  outline: 3px solid #06B6D4;
+  outline-offset: 3px;
 }
 
 #hh-indicator.hh-green { background: #22c55e; }
@@ -26,7 +38,8 @@
   position: fixed;
   bottom: 120px;
   right: 40px;
-  width: 300px;
+  width: 340px;
+  max-width: calc(100vw - 48px);
   max-height: 70vh;
   overflow-y: auto;
   z-index: 2147483646;
@@ -80,9 +93,17 @@
 }
 
 .hh-panel-point {
+  /* 2. Larger, easier-to-read advice text (was 13px) */
   color: #334155;
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 16px;
+  line-height: 1.6;
   padding-left: 0;
   border-left: none;
+}
+
+/* 3. Respect people whose device asks for less motion */
+@media (prefers-reduced-motion: reduce) {
+  #hh-indicator {
+    transition: none;
+  }
 }
