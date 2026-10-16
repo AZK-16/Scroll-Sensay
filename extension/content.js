@@ -2,7 +2,7 @@ const SCROLL_DEBOUNCE = 3000;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-2';
+const BUILD = 'a11y-merge-5';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 let enabled = false;
@@ -19,15 +19,20 @@ let pageEpoch = 0; // bumps whenever the user moves to a different page
 const indicator = document.createElement('button');
 indicator.id = 'hh-indicator';
 indicator.type = 'button';
+// The button is added at the END of the page, which would make it the LAST Tab stop (after every
+// link). A tabindex above 0 puts it FIRST in the Tab order instead, so one press of Tab from the top
+// of a freshly loaded page reaches it, without moving anything around in the page itself.
+indicator.tabIndex = 1;
 indicator.setAttribute('aria-haspopup', 'dialog');
 indicator.setAttribute('aria-expanded', 'false');
 indicator.setAttribute('aria-controls', 'hh-panel');
 indicator.setAttribute('aria-keyshortcuts', 'Alt+Shift+S');
+const SHORTCUT_MOD = (typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent || '')) ? 'Option' : 'Alt';
+indicator.title = 'ScrollSensay: press ' + SHORTCUT_MOD + '+Shift+S from anywhere to open or close the advice';
 const indicatorEmoji = document.createElement('span');
 indicatorEmoji.setAttribute('aria-hidden', 'true');
 indicatorEmoji.textContent = '😊';
 indicator.appendChild(indicatorEmoji);
-document.body.appendChild(indicator);
 
 const SIGNAL_WORDS = {
   green: 'No concerns found',
@@ -58,7 +63,25 @@ panel.id = 'hh-panel';
 panel.setAttribute('role', 'dialog');
 panel.setAttribute('aria-label', "Sensay's advice");
 panel.tabIndex = -1; // lets the panel take focus when it opens
-document.body.appendChild(panel);
+
+// --- Landmark for screen readers ---
+// Screen reader users don't move with Tab; they jump between named regions ("landmarks") with
+// one key (NVDA/JAWS) or the Landmarks rotor (VoiceOver). This named region lets them jump
+// straight to ScrollSensay from anywhere on the page.
+// It must not change how the page looks or lays out, so it is deliberately inert:
+//  - NOT positioned, so it creates no stacking context and the face/panel keep their very high
+//    z-index and stay above the page's own content;
+//  - zero height with no margin, padding or border, so it adds no blank space even if the site
+//    styles every <div> on the page;
+//  - hidden while the extension is switched off, so a screen reader is never told about an
+//    empty "ScrollSensay" region (see applyEnabledState).
+const landmark = document.createElement('div');
+landmark.setAttribute('role', 'region');
+landmark.setAttribute('aria-label', 'ScrollSensay');
+Object.assign(landmark.style, { display: 'none', height: '0', minHeight: '0', margin: '0', padding: '0', border: '0', overflow: 'visible' });
+landmark.appendChild(indicator);
+landmark.appendChild(panel);
+document.body.appendChild(landmark);
 
 function buildPanel() {
   panel.innerHTML = '';
@@ -153,7 +176,12 @@ if (window.speechSynthesis) {
   speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
 }
 
+// Where keyboard focus was just before the advice opened (e.g. a link deep in the article).
+let returnFocusTo = null;
+
 function showPanel() {
+  const active = document.activeElement;
+  returnFocusTo = (active && active !== document.body && active !== panel && !panel.contains(active)) ? active : null;
   buildPanel();
   panel.classList.add('hh-open');
   panelOpen = true;
@@ -166,10 +194,17 @@ function hidePanel(returnFocus) {
   panel.classList.remove('hh-open');
   panelOpen = false;
   indicator.setAttribute('aria-expanded', 'false');
-  if (returnFocus || hadFocus) indicator.focus(); // don't strand keyboard users
+  if (returnFocus || hadFocus) {
+    // Put the user back exactly where they were; fall back to the ScrollSensay button if that
+    // spot has gone. Either way a keyboard user is never stranded.
+    const back = returnFocusTo;
+    const canReturn = back && back.isConnected !== false && typeof back.focus === 'function';
+    (canReturn ? back : indicator).focus();
+  }
+  returnFocusTo = null;
 }
 
-// Escape closes the advice and puts focus back on the ScrollSensay button.
+// Escape closes the advice and puts focus back where the user was.
 panel.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     e.stopPropagation();
@@ -203,8 +238,10 @@ function applyEnabledState() {
   if (!enabled) {
     hidePanel();
     indicator.style.display = 'none';
+    landmark.style.display = 'none'; // no empty "ScrollSensay" region for screen readers
   } else {
     indicator.style.display = '';
+    landmark.style.display = '';
   }
 }
 
