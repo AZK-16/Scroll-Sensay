@@ -34,6 +34,29 @@
 #hh-indicator.hh-amber { background: #f59e0b; }
 #hh-indicator.hh-red   { background: #ef4444; }
 
+/* FIX 5: the face and speaker are <button>s now, and some sites (e.g. express.co.uk) style every
+   button on the page, which made them square. !important keeps our shape whatever the site says. */
+#hh-indicator, .hh-panel-audio {
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  border-radius: 50% !important;
+  border: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  background-image: none !important;
+  text-transform: none !important;
+  letter-spacing: normal !important;
+}
+#hh-indicator { width: 60px !important; height: 60px !important; box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important; }
+.hh-panel-audio { width: 40px !important; height: 40px !important; box-shadow: none !important; }
+#hh-indicator:not(.hh-green):not(.hh-amber):not(.hh-red) { background-color: #94a3b8 !important; }
+#hh-indicator.hh-green { background-color: #22c55e !important; }
+#hh-indicator.hh-amber { background-color: #f59e0b !important; }
+#hh-indicator.hh-red   { background-color: #ef4444 !important; }
+.hh-panel-audio { background-color: #e2e8f0 !important; }
+
 #hh-panel {
   position: fixed;
   bottom: 120px;

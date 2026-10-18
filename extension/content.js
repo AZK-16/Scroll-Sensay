@@ -2,8 +2,12 @@ const SCROLL_DEBOUNCE = 3000;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-5';
+const BUILD = 'a11y-merge-5-bugfix-1';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
+
+// Messages shown on the grey "no verdict" face.
+const MSG_FAILED = "Couldn't check this just now. It will try again when you scroll.";
+const MSG_TOO_LITTLE = "Not enough text on screen to check. Scroll to the main story and it will try again.";
 
 let enabled = false;
 let lastViewportText = '';
@@ -48,6 +52,7 @@ function setIndicatorLabel(label) {
 setIndicatorLabel(null);
 
 function setIndicator(label) {
+  ensureMounted();
   indicator.classList.remove('hh-green', 'hh-amber', 'hh-red');
   if (label === 'green')      { indicator.classList.add('hh-green'); indicatorEmoji.textContent = '😊'; }
   else if (label === 'amber') { indicator.classList.add('hh-amber'); indicatorEmoji.textContent = '🤔'; }
@@ -82,6 +87,20 @@ Object.assign(landmark.style, { display: 'none', height: '0', minHeight: '0', ma
 landmark.appendChild(indicator);
 landmark.appendChild(panel);
 document.body.appendChild(landmark);
+
+// FIX 1: some sites (e.g. ok.co.uk, built with React) rebuild the whole page just after it loads,
+// which silently deletes our face and panel. Put them back whenever they have gone missing.
+// Only while the extension is switched ON, so a switched-off extension never adds anything to a page.
+function ensureMounted() {
+  if (enabled && !landmark.isConnected && document.body) document.body.appendChild(landmark);
+}
+// Page rebuilds usually happen in the first few seconds, so check briefly after load...
+let mountChecks = 0;
+const mountTimer = setInterval(() => {
+  ensureMounted();
+  if (++mountChecks >= 15) clearInterval(mountTimer); // ~30 seconds, then stop
+}, 2000);
+// ...and again on every scroll, shortcut press, result and switch-on (see below).
 
 function buildPanel() {
   panel.innerHTML = '';
@@ -224,13 +243,17 @@ document.addEventListener('click', (e) => {
 // Keyboard shortcut: Alt+Shift+S (Option+Shift+S on a Mac) opens or closes the advice from anywhere.
 // The button sits at the END of the page's Tab order, so without this a keyboard user would have to
 // Tab through every link on the page first. It is ignored while typing in a text field.
-document.addEventListener('keydown', (e) => {
+// FIX 6: listen on window in the CAPTURE phase (the `true` at the end), so we hear the key BEFORE the website
+// does. Sites with their own shortcuts (e.g. Reddit, Facebook, X) were swallowing it first.
+window.addEventListener('keydown', (e) => {
   if (!enabled || !e.altKey || !e.shiftKey || e.code !== 'KeyS') return;
   const t = e.target;
   if (t && t.closest && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
   e.preventDefault();
+  e.stopPropagation(); // FIX 6: we have handled it, so the site does not also act on it
+  ensureMounted();
   panelOpen ? hidePanel(true) : showPanel();
-});
+}, true);
 
 // --- Enabled state (storage-driven, live-updating, opt-in by default) ---
 
@@ -242,6 +265,7 @@ function applyEnabledState() {
   } else {
     indicator.style.display = '';
     landmark.style.display = '';
+    ensureMounted(); // FIX 1: restore it if the page deleted it while we were off
   }
 }
 
@@ -255,7 +279,7 @@ function attemptScanUntilReady(retriesLeft = SCAN_READY_MAX_RETRIES) {
     updateIndicator(); // real content found — run the actual scan now
     return;
   }
-  if (retriesLeft <= 0) return; // give up quietly; a scroll will trigger it naturally later
+  if (retriesLeft <= 0) { showUnavailableIfEmpty(MSG_TOO_LITTLE); return; } // FIX 2: tell the reader, don't go silent
   setTimeout(() => attemptScanUntilReady(retriesLeft - 1), SCAN_READY_RETRY_DELAY);
 }
 
@@ -439,10 +463,10 @@ function getViewportText() {
 let scanRequestId = 0;
 let lastShownRequestId = 0;
 
-function showUnavailableIfEmpty() {
-  // Only when nothing is on display yet; never replace a good result with an error.
-  if (lastResult.label !== null) return;
-  lastResult = { label: 'unavailable', explanation: ["Couldn't check this just now. It will try again when you scroll."] };
+function showUnavailableIfEmpty(message = MSG_FAILED) {
+  // Only when nothing is on display yet (or a previous grey message is showing); never replace a real result.
+  if (lastResult.label !== null && lastResult.label !== 'unavailable') return;
+  lastResult = { label: 'unavailable', explanation: [message] };
   setIndicator('unavailable'); // neutral grey face, and screen readers hear the same words as the panel
   if (panelOpen) buildPanel();
 }
@@ -450,7 +474,7 @@ function showUnavailableIfEmpty() {
 async function updateIndicator() {
   if (!enabled) return; // hard gate: no scan, no API call, no cost, while inactive
   const text = getViewportText();
-  if (!text || text.length < 200) return;
+  if (!text || text.length < 200) { showUnavailableIfEmpty(MSG_TOO_LITTLE); return; } // FIX 2
   if (text === lastViewportText) return;
   if (lastViewportText && text.slice(0, 500) === lastViewportText.slice(0, 500)) return;
 
@@ -475,6 +499,7 @@ async function updateIndicator() {
 
 let scrollTimer;
 window.addEventListener('scroll', () => {
+  ensureMounted(); // FIX 1
   clearTimeout(scrollTimer);
   scrollTimer = setTimeout(updateIndicator, SCROLL_DEBOUNCE);
 }, { passive: true });

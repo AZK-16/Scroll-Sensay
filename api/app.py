@@ -63,6 +63,22 @@ def _within_limit(kind: str, limit: int) -> bool:
         return True
 
 
+# Words found in almost every live finding ("Sources report that ..."). They say nothing about WHAT was found, so
+# they are ignored when deciding whether two findings are the same.
+_FINDING_BOILERPLATE = {"checked", "live", "sources", "source", "report", "reports", "reported", "that", "the", "and"}
+
+
+def _similar(a: str, b: str, threshold: float = 0.6) -> bool:
+    """FIX 3: True if two live findings share most of their meaningful words ("moved back" vs "relocated back")."""
+    def words(s: str) -> set:
+        cleaned = "".join(ch if ch.isalnum() else " " for ch in s.lower())
+        return {w for w in cleaned.split() if len(w) > 2 and w not in _FINDING_BOILERPLATE}
+    wa, wb = words(a), words(b)
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / len(wa | wb) >= threshold
+
+
 def _same_claim(a: str, b: str) -> bool:
     """True only if two claims are identical apart from case and punctuation (no fuzzy matching)."""
     norm = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())
@@ -289,11 +305,16 @@ def analyze_text(text: str) -> dict:
     if slots:
         results = _live_check([claim for _, _, claim in slots], tally)
         verdicts = []
+        shown = []  # FIX 3: (status, finding) pairs already written into the explanation
         for (label, point, _), (status, detail) in zip(slots, results):
             verdicts.append(f"{label}: {status}")
             if status in ("SUPPORTED", "REFUTED"):
                 fallback = "sources support this claim." if status == "SUPPORTED" else "sources did not support this claim."
-                explanation[min(point, len(explanation) - 1)] = f"Checked live: {detail or fallback}"[:140]
+                finding = detail or fallback
+                if any(status == s and _similar(finding, f) for s, f in shown):
+                    continue  # FIX 3: same finding as the other search, so keep the original reason instead of repeating it
+                explanation[min(point, len(explanation) - 1)] = f"Checked live: {finding}"[:140]
+                shown.append((status, finding))
         check = ", ".join(verdicts)
         statuses = [status for status, _ in results]
         if "REFUTED" in statuses:
