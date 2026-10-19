@@ -2,7 +2,7 @@ const SCROLL_DEBOUNCE = 3000;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-5-bugfix-1';
+const BUILD = 'a11y-merge-6-bugfix-1';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
@@ -66,7 +66,10 @@ function setIndicator(label) {
 const panel = document.createElement('div');
 panel.id = 'hh-panel';
 panel.setAttribute('role', 'dialog');
-panel.setAttribute('aria-label', "Sensay's advice");
+panel.setAttribute('aria-label', "Sensay's advice"); // fallback name while the panel has not been built yet
+// Once built, the panel is named by its title ("Sensay's Advice: Some concerns here"), so a screen reader
+// announces the verdict as soon as the advice opens instead of just "Sensay's advice, dialog".
+panel.setAttribute('aria-labelledby', 'hh-panel-title');
 panel.tabIndex = -1; // lets the panel take focus when it opens
 
 // --- Landmark for screen readers ---
@@ -78,15 +81,22 @@ panel.tabIndex = -1; // lets the panel take focus when it opens
 //    z-index and stay above the page's own content;
 //  - zero height with no margin, padding or border, so it adds no blank space even if the site
 //    styles every <div> on the page;
-//  - hidden while the extension is switched off, so a screen reader is never told about an
-//    empty "ScrollSensay" region (see applyEnabledState).
+//  - not in the page at all while the extension is switched off, so a screen reader is never told
+//    about an empty "ScrollSensay" region (see applyEnabledState).
+// It is also never created hidden and revealed later: it goes into the page fully built and already
+// visible, in one step, only once we know the extension is ON. (A landmark that is created hidden and
+// revealed afterwards was not listed by VoiceOver's Landmarks rotor; one inserted visible was.)
+//
+// If VoiceOver's Landmarks rotor still does not list ScrollSensay, change this one word to
+// 'complementary' (the standard landmark for supporting content), reload the extension and test again.
+const LANDMARK_ROLE = 'region';
 const landmark = document.createElement('div');
-landmark.setAttribute('role', 'region');
+landmark.setAttribute('role', LANDMARK_ROLE);
 landmark.setAttribute('aria-label', 'ScrollSensay');
-Object.assign(landmark.style, { display: 'none', height: '0', minHeight: '0', margin: '0', padding: '0', border: '0', overflow: 'visible' });
+Object.assign(landmark.style, { height: '0', minHeight: '0', margin: '0', padding: '0', border: '0', overflow: 'visible' });
 landmark.appendChild(indicator);
 landmark.appendChild(panel);
-document.body.appendChild(landmark);
+// NOT added to the page here: see applyEnabledState / ensureMounted below.
 
 // FIX 1: some sites (e.g. ok.co.uk, built with React) rebuild the whole page just after it loads,
 // which silently deletes our face and panel. Put them back whenever they have gone missing.
@@ -103,6 +113,9 @@ const mountTimer = setInterval(() => {
 // ...and again on every scroll, shortcut press, result and switch-on (see below).
 
 function buildPanel() {
+  // If the advice refreshes while someone is inside it (a new verdict arrives), keep their focus in it.
+  // Rebuilding the contents would otherwise drop focus back to the page, and a screen reader loses its place.
+  const hadFocus = panel.contains(document.activeElement);
   panel.innerHTML = '';
 
   const header = document.createElement('div');
@@ -112,6 +125,7 @@ function buildPanel() {
 
   const title = document.createElement('div');
   title.className = 'hh-panel-title';
+  title.id = 'hh-panel-title'; // names the dialog (see aria-labelledby above)
   title.textContent = lastResult.label === null ? "Sensay's Advice:\nStill scanning…"
     : lastResult.label === 'unavailable' ? "Sensay's Advice:\nCouldn't check this just now"
     : lastResult.label === 'green' ? "Sensay's Advice:\nNo concerns found"
@@ -148,6 +162,8 @@ function buildPanel() {
       });
     }
   }
+
+  if (hadFocus) panel.focus();
 }
 
 function pickVoice() {
@@ -261,11 +277,10 @@ function applyEnabledState() {
   if (!enabled) {
     hidePanel();
     indicator.style.display = 'none';
-    landmark.style.display = 'none'; // no empty "ScrollSensay" region for screen readers
+    if (landmark.isConnected) landmark.remove(); // gone entirely: no empty "ScrollSensay" region for screen readers
   } else {
     indicator.style.display = '';
-    landmark.style.display = '';
-    ensureMounted(); // FIX 1: restore it if the page deleted it while we were off
+    ensureMounted(); // inserted already visible, in one step (also restores it if the page deleted it while we were off)
   }
 }
 
