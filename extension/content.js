@@ -39,7 +39,7 @@ indicatorEmoji.textContent = '😊';
 indicator.appendChild(indicatorEmoji);
 
 const SIGNAL_WORDS = {
-  green: 'No concerns found',
+  green: 'No major concerns',
   amber: 'Worth a second look',
   red: 'Some concerns here',
   unavailable: "Couldn't check this just now",
@@ -128,7 +128,7 @@ function buildPanel() {
   title.id = 'hh-panel-title'; // names the dialog (see aria-labelledby above)
   title.textContent = lastResult.label === null ? "Sensay's Advice:\nStill scanning…"
     : lastResult.label === 'unavailable' ? "Sensay's Advice:\nCouldn't check this just now"
-    : lastResult.label === 'green' ? "Sensay's Advice:\nNo concerns found"
+    : lastResult.label === 'green' ? "Sensay's Advice:\nNo major concerns"
     : lastResult.label === 'amber' ? "Sensay's Advice:\nWorth a second look"
     : "Sensay's Advice:\nSome concerns here";
   title.style.whiteSpace = 'pre-line';

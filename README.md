@@ -2,7 +2,7 @@
 
 ScrollSensay watches the content in your viewport as you browse and flags potentially misleading or untrustworthy text in real time. Powered by Google Gemini, it uses a traffic-light indicator based on the result:
 
-- 🟢 Green, no concerns found 😊
+- 🟢 Green, no major concerns 😊
 - 🟡 Amber, worth a second look 🤔
 - 🔴 Red, some concerns here 😧
 
