@@ -37,13 +37,24 @@ MAX_SCANS_PER_HOUR = int(os.getenv("MAX_SCANS_PER_HOUR", "600"))       # spend c
 MAX_SEARCHES_PER_HOUR = int(os.getenv("MAX_SEARCHES_PER_HOUR", "60"))  # search ceiling (0 = no limit)
 
 # Hidden "thinking" is billed as output and shares the maxOutputTokens budget, so keep it low.
-THINKING_LEVEL = "low"  # minimal | low | medium | high
+_LEVELS = ("minimal", "low", "medium", "high")
+def _level(env_name: str, default: str) -> str:
+    value = os.getenv(env_name, default).strip().lower()
+    if value not in _LEVELS:
+        print(f"[ScrollSensay] {env_name}={value!r} is not one of {_LEVELS}; using {default!r}")
+        return default
+    return value
+# Both default to "low", exactly as before. They exist so you can TRY a faster, less thorough setting and judge the
+# quality yourself: THINKING_LEVEL is the first evaluation, LIVE_CHECK_THINKING is the live-search step on its own.
+THINKING_LEVEL = _level("THINKING_LEVEL", "low")  # minimal | low | medium | high
+LIVE_CHECK_THINKING = _level("LIVE_CHECK_THINKING", THINKING_LEVEL)
 
 # Estimate only (USD per token, Gemini 3.x Flash through 31 Dec 2026) — for the cost shown in the log.
 PRICE_IN, PRICE_OUT, USD_TO_GBP = 0.75 / 1e6, 3.75 / 1e6, 0.75
 
 print(f"Model: {MODEL_NAME} | grounding: {GROUNDING_ENABLED} | limits/hour: "
-      f"{MAX_SCANS_PER_HOUR} scans, {MAX_SEARCHES_PER_HOUR} searches")
+      f"{MAX_SCANS_PER_HOUR} scans, {MAX_SEARCHES_PER_HOUR} searches | thinking: {THINKING_LEVEL} "
+      f"(live check: {LIVE_CHECK_THINKING})")
 
 _lock = threading.Lock()
 _recent = {"scan": [], "search": []}  # timestamps in the last hour, for the two limits
@@ -155,7 +166,7 @@ def parse_validation_response(response_text: str) -> dict:
 
 
 # ------------------------------------------------------------ Gemini calls
-def _generate(prompt: str, max_tokens: int, tally: dict, search: bool = False, timeout: int = 30):
+def _generate(prompt: str, max_tokens: int, tally: dict, search: bool = False, timeout: int = 30, thinking: str = None):
     """One Gemini call. Returns the reply text (None if there was no visible answer).
     Raises HTTPException for HTTP-level problems; a 429 keeps its Retry-After."""
     global _session_usd
@@ -164,7 +175,7 @@ def _generate(prompt: str, max_tokens: int, tally: dict, search: bool = False, t
         "generationConfig": {
             "temperature": 0.0,
             "maxOutputTokens": max_tokens,
-            "thinkingConfig": {"thinkingLevel": THINKING_LEVEL},
+            "thinkingConfig": {"thinkingLevel": thinking or THINKING_LEVEL},
         },
     }
     if search:
@@ -172,10 +183,14 @@ def _generate(prompt: str, max_tokens: int, tally: dict, search: bool = False, t
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
     headers = {"X-goog-api-key": os.getenv("GOOGLE_API_KEY", ""), "Content-Type": "application/json"}
 
+    kind = "live search" if search else "evaluation"
+    t_call = time.perf_counter()
     try:
         resp = requests.post(url, json=payload, timeout=timeout, headers=headers)
     except RequestException as exc:
+        print(f"[ScrollSensay] Gemini {kind} call FAILED after {time.perf_counter() - t_call:.1f}s: {exc}")
         raise HTTPException(status_code=502, detail=f"Request to Gemini failed: {exc}")
+    print(f"[ScrollSensay] Gemini {kind} call: {time.perf_counter() - t_call:.1f}s (HTTP {resp.status_code})")
 
     if resp.status_code == 429:
         retry_after = 60
@@ -186,6 +201,7 @@ def _generate(prompt: str, max_tokens: int, tally: dict, search: bool = False, t
                     break
         except Exception:
             pass
+        print(f"[ScrollSensay] Gemini rate limit (429): told to wait {retry_after}s")
         raise HTTPException(status_code=429, detail="Rate limited by Gemini", headers={"Retry-After": str(retry_after)})
     if not resp.ok:
         raise HTTPException(status_code=502, detail=f"Gemini {resp.status_code}: {resp.text}")
@@ -241,7 +257,7 @@ def _live_check(claims: list, tally: dict) -> list:
         "No markdown or text outside the JSON."
     )
     try:
-        data = parse_validation_response(_generate(prompt, 1024, tally, search=True, timeout=20) or "")
+        data = parse_validation_response(_generate(prompt, 1024, tally, search=True, timeout=20, thinking=LIVE_CHECK_THINKING) or "")
         items = data if isinstance(data, list) else data.get("results")
         if not isinstance(items, list):
             items = [data]  # tolerate a single bare object
@@ -269,6 +285,7 @@ def analyze_text(text: str) -> dict:
 
     prompt = build_validation_prompt(text)
     tally = {"usd": 0.0}
+    t_start = time.perf_counter()
 
     # Stage 1: the evaluation. Thinking shares the token budget with the answer, so if the
     # reply is cut off or unreadable, try once more with more room.
@@ -286,6 +303,7 @@ def analyze_text(text: str) -> dict:
 
     score = float(parsed["score"])
     explanation = [str(p) for p in parsed["explanation"]]
+    t_stage1 = time.perf_counter()
 
     # Stage 2: live search for up to TWO claims in ONE call. "weak point" = the claim Stage 1 can't
     # confirm that matters most; "clash" = a claim that conflicts with its memory. Out-of-date
@@ -325,8 +343,10 @@ def analyze_text(text: str) -> dict:
     level = "green" if score >= 0.7 else "amber" if score >= 0.4 else "red"
     with _lock:
         session = _session_usd
+    t_end = time.perf_counter()
     print(f"[ScrollSensay] SCAN {level} {score:.2f} | live check: {check} | "
-          f"this scan ~{tally['usd'] * USD_TO_GBP * 100:.2f}p | session ~£{session * USD_TO_GBP:.3f}")
+          f"this scan ~{tally['usd'] * USD_TO_GBP * 100:.2f}p | session ~£{session * USD_TO_GBP:.3f} | "
+          f"time: evaluation {t_stage1 - t_start:.1f}s, live check {t_end - t_stage1:.1f}s, total {t_end - t_start:.1f}s")
 
     return {"score": score, "explanation": explanation}
 

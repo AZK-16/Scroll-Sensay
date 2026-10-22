@@ -1,8 +1,11 @@
-const SCROLL_DEBOUNCE = 3000;
+// How long to wait after you STOP scrolling before checking what is on screen (milliseconds). Everything else about
+// how a check works is unchanged. It was 3000. Shorter = a verdict sooner but more checks (each costs about 0.1p),
+// because people pause more often than they linger. Raise it if cost matters more than speed.
+const SCROLL_DEBOUNCE = 1200;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-6-bugfix-1';
+const BUILD = 'a11y-merge-6-fastpause-1';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
