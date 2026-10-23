@@ -5,7 +5,7 @@ const SCROLL_DEBOUNCE = 1200;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-6-fastpause-1';
+const BUILD = 'a11y-merge-6-triggers-2';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
@@ -14,6 +14,7 @@ const MSG_TOO_LITTLE = "Not enough text on screen to check. Scroll to the main s
 
 let enabled = false;
 let lastViewportText = '';
+let lastViewportHref = ''; // the full address (including the part after #) the verdict on display belongs to
 let lastResult = { label: null, explanation: [] };
 let panelOpen = false;
 let pageEpoch = 0; // bumps whenever the user moves to a different page
@@ -281,9 +282,11 @@ function applyEnabledState() {
     hidePanel();
     indicator.style.display = 'none';
     if (landmark.isConnected) landmark.remove(); // gone entirely: no empty "ScrollSensay" region for screen readers
+    stopChangeWatch(); // while switched off we do not watch the page at all
   } else {
     indicator.style.display = '';
     ensureMounted(); // inserted already visible, in one step (also restores it if the page deleted it while we were off)
+    startChangeWatch();
   }
 }
 
@@ -339,6 +342,9 @@ function handlePossibleNavigation() {
   // Reset state so the new page's content isn't compared against the
   // previous page's last-scanned text or shown result.
   lastViewportText = '';
+  lastViewportHref = '';
+  stashedResult = null;
+  lastChangeText = '';
   lastResult = { label: null, explanation: [] };
   pageEpoch++; // replies still in flight belong to the previous page, so they won't be shown
   setIndicator(null);
@@ -481,6 +487,27 @@ function getViewportText() {
 let scanRequestId = 0;
 let lastShownRequestId = 0;
 
+// The verdict that a "not enough text" message replaced, so that it can come straight back (without another
+// check, and without cost) if the reader scrolls back to the text it was for.
+let stashedResult = null; // { result, text }
+
+function sameScreen(a, b) {
+  return !!a && !!b && (a === b || a.slice(0, 500) === b.slice(0, 500));
+}
+
+// A verdict for text that is no longer on screen is misleading, so when the screen now has too little text to
+// check we SAY so, even though an earlier verdict is on display. (Failures to reach the server are different:
+// those still never replace a good verdict; see showUnavailableIfEmpty.)
+function showTooLittleText() {
+  lastShownRequestId = scanRequestId; // replies for screens we have already left must not cover this message
+  if (lastResult.label === 'unavailable' && lastResult.explanation[0] === MSG_TOO_LITTLE) return; // already showing it
+  if (lastResult.label && lastResult.label !== 'unavailable') stashedResult = { result: lastResult, text: lastViewportText, href: lastViewportHref };
+  lastViewportText = ''; // so the next screen with real text is checked, or the stashed verdict is restored
+  lastResult = { label: 'unavailable', explanation: [MSG_TOO_LITTLE] };
+  setIndicator('unavailable');
+  if (panelOpen) buildPanel();
+}
+
 function showUnavailableIfEmpty(message = MSG_FAILED) {
   // Only when nothing is on display yet (or a previous grey message is showing); never replace a real result.
   if (lastResult.label !== null && lastResult.label !== 'unavailable') return;
@@ -489,15 +516,27 @@ function showUnavailableIfEmpty(message = MSG_FAILED) {
   if (panelOpen) buildPanel();
 }
 
-async function updateIndicator() {
+async function updateIndicator(givenText) {
   if (!enabled) return; // hard gate: no scan, no API call, no cost, while inactive
-  const text = getViewportText();
-  if (!text || text.length < 200) { showUnavailableIfEmpty(MSG_TOO_LITTLE); return; } // FIX 2
+  const text = typeof givenText === 'string' ? givenText : getViewportText();
+  if (!text || text.length < 200) { showTooLittleText(); return; }
+  if (stashedResult && sameScreen(text, stashedResult.text)) {
+    // Back on the text the earlier verdict was for: bring that verdict back instead of checking again.
+    lastResult = stashedResult.result;
+    lastViewportText = stashedResult.text;
+    lastViewportHref = stashedResult.href;
+    stashedResult = null;
+    lastShownRequestId = scanRequestId;
+    setIndicator(lastResult.label);
+    if (panelOpen) buildPanel();
+    return;
+  }
   if (text === lastViewportText) return;
   if (lastViewportText && text.slice(0, 500) === lastViewportText.slice(0, 500)) return;
 
   const thisRequestId = ++scanRequestId;
   const epoch = pageEpoch;
+  const href = location.href;
 
   try {
     const result = await callAPI(text);
@@ -505,7 +544,9 @@ async function updateIndicator() {
     if (result && epoch === pageEpoch && thisRequestId > lastShownRequestId) {
       lastShownRequestId = thisRequestId;
       lastViewportText = text;
+      lastViewportHref = href;
       lastResult = result;
+      stashedResult = null; // a newer verdict replaces any older one we were holding on to
       setIndicator(result.label);
       if (panelOpen) buildPanel();
     }
@@ -515,12 +556,110 @@ async function updateIndicator() {
   }
 }
 
+// --- What starts a check -------------------------------------------------------------------------------------
+// 1) Scrolling. We listen in the CAPTURE phase because scroll events do not bubble: apps like webmail scroll an
+//    inner pane, whose scroll events never reach a normal window listener. Small scrollers (a code box, a
+//    carousel, a text field) and our own advice panel are ignored, so they cannot keep postponing a check.
 let scrollTimer;
-window.addEventListener('scroll', () => {
+let lastScrollAt = 0;
+window.addEventListener('scroll', (e) => {
+  const t = e.target;
+  if (t && t !== document && t.nodeType === 1) {
+    if (landmark.contains(t)) return;
+    if (t.clientWidth * t.clientHeight < 0.2 * window.innerWidth * window.innerHeight) return;
+  }
+  lastScrollAt = Date.now();
   ensureMounted(); // FIX 1
   clearTimeout(scrollTimer);
   scrollTimer = setTimeout(updateIndicator, SCROLL_DEBOUNCE);
-}, { passive: true });
+}, { passive: true, capture: true });
+
+// 2) The text on screen changing WITHOUT any scrolling: opening the next email, clicking to another post, a
+//    view that finishes loading. Nothing announces that, and apps that route with #hash do not even count as a
+//    page change, so previously nothing happened until something else prodded us. We now look when the page
+//    changes shortly after the reader clicked, typed, tapped or scrolled. The look itself is cheap and heavily
+//    rate-limited, and a check (which costs money) still only starts if the text on screen is really new.
+const INPUT_WINDOW_MS = 10000;   // only react to changes this soon after the reader did something
+const CHANGE_SETTLE_MS = 800;    // let a change finish (an email body still loading) before looking
+const CHANGE_MAX_WAIT_MS = 3000; // ...but never wait longer than this on a page that keeps changing
+const CHANGE_MIN_GAP_MS = 2500;  // and look at most this often
+const CHANGE_SCANS_PER_MINUTE = 10; // hard ceiling on checks started this way (a page that rewrites itself non-stop)
+
+let lastInputAt = 0;
+let lastChangeRunAt = 0;
+let lastChangeText = '';
+let changeScanTimes = [];
+let changeTimer = null;
+let changePendingSince = 0;
+let changeObserver = null;
+
+['click', 'keydown', 'pointerdown', 'touchstart', 'wheel'].forEach((type) => {
+  window.addEventListener(type, () => { lastInputAt = Date.now(); }, { capture: true, passive: true });
+});
+
+// True if two screens of text are essentially the same (a clock, a counter or a "2 min ago" changed, not the content):
+// nine in ten distinct words are shared. Used ONLY for changes nobody scrolled to; scrolling uses the original rule.
+function mostlySame(a, b) {
+  if (!a || !b) return false;
+  const words = (s) => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2));
+  const wa = words(a), wb = words(b);
+  if (!wa.size || !wb.size) return false;
+  let shared = 0;
+  wa.forEach((w) => { if (wb.has(w)) shared++; });
+  return shared / (wa.size + wb.size - shared) >= 0.9;
+}
+
+function scheduleChangeCheck() {
+  const now = Date.now();
+  if (!changePendingSince) changePendingSince = now;
+  clearTimeout(changeTimer);
+  const settle = Math.min(CHANGE_SETTLE_MS, Math.max(0, changePendingSince + CHANGE_MAX_WAIT_MS - now));
+  changeTimer = setTimeout(runChangeCheck, Math.max(settle, lastChangeRunAt + CHANGE_MIN_GAP_MS - now));
+}
+
+function runChangeCheck() {
+  changeTimer = null;
+  changePendingSince = 0;
+  lastChangeRunAt = Date.now();
+  if (!enabled || document.visibilityState !== 'visible') return;
+  if (Date.now() - lastScrollAt < SCROLL_DEBOUNCE) return; // mid-scroll: the scroll handler checks when it stops
+  const text = getViewportText();
+  if (text === lastChangeText) return; // nothing different on screen since we last looked
+  lastChangeText = text;
+  // Webmail and similar apps change the part after the # for every email. If the address is no longer the one the
+  // verdict on display belongs to, this is a different item, so never dismiss it as "the same content" (the check
+  // below still skips it if the top of the screen is unchanged, and the cost ceiling still applies).
+  const addressChanged = location.href !== lastViewportHref;
+  if (text.length >= 200 && !addressChanged && mostlySame(text, lastViewportText)) return;
+  if (text.length >= 200) {
+    const now = Date.now();
+    changeScanTimes = changeScanTimes.filter((t) => now - t < 60000);
+    if (changeScanTimes.length >= CHANGE_SCANS_PER_MINUTE) { lastChangeText = ''; return; } // cost ceiling: look again later
+    changeScanTimes.push(now);
+  }
+  updateIndicator(text);
+}
+
+function startChangeWatch() {
+  if (!changeObserver) {
+    changeObserver = new MutationObserver((records) => {
+      if (!enabled || Date.now() - lastInputAt > INPUT_WINDOW_MS) return;
+      if (records.every((r) => landmark.contains(r.target))) return; // only our own widget changed
+      scheduleChangeCheck();
+    });
+  }
+  changeObserver.observe(document.documentElement, {
+    childList: true, subtree: true, characterData: true,
+    attributes: true, attributeFilter: ['hidden', 'class', 'style', 'aria-hidden'],
+  });
+}
+
+function stopChangeWatch() {
+  if (changeObserver) changeObserver.disconnect();
+  clearTimeout(changeTimer);
+  changeTimer = null;
+  changePendingSince = 0;
+}
 
 // Note: the initial updateIndicator() call happens inside the
 // chrome.storage.local.get callback above, once the real `enabled`
