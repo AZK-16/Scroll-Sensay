@@ -6,7 +6,7 @@ const SCROLL_DEBOUNCE = 2200;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-6-steady-4';
+const BUILD = 'a11y-merge-6-refresh-1';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
@@ -37,7 +37,7 @@ indicator.setAttribute('aria-expanded', 'false');
 indicator.setAttribute('aria-controls', 'hh-panel');
 indicator.setAttribute('aria-keyshortcuts', 'Alt+Shift+S');
 const SHORTCUT_MOD = (typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent || '')) ? 'Option' : 'Alt';
-indicator.title = 'ScrollSensay: press ' + SHORTCUT_MOD + '+Shift+S from anywhere to open or close the advice';
+indicator.title = 'ScrollSensay: press ' + SHORTCUT_MOD + '+Shift+S from anywhere to open or close the advice. Drag to move it, or use Shift+arrow keys.';
 const indicatorEmoji = document.createElement('span');
 indicatorEmoji.setAttribute('aria-hidden', 'true');
 indicatorEmoji.textContent = '😊';
@@ -102,6 +102,21 @@ landmark.setAttribute('aria-label', 'ScrollSensay');
 Object.assign(landmark.style, { height: '0', minHeight: '0', margin: '0', padding: '0', border: '0', overflow: 'visible' });
 landmark.appendChild(indicator);
 landmark.appendChild(panel);
+
+// A visually hidden status line that screen readers announce politely ("Checking again…", "Updated. …"). It lives
+// outside the advice panel because the panel is rebuilt whenever its contents change, and a live region has to
+// exist before its text changes to be announced reliably.
+const statusEl = document.createElement('div');
+statusEl.setAttribute('role', 'status');
+statusEl.setAttribute('aria-live', 'polite');
+Object.assign(statusEl.style, { position: 'absolute', width: '1px', height: '1px', margin: '-1px', padding: '0', border: '0', overflow: 'hidden', clip: 'rect(0 0 0 0)', clipPath: 'inset(50%)', whiteSpace: 'nowrap' });
+landmark.appendChild(statusEl);
+let statusTimer = null;
+function announce(message) {
+  clearTimeout(statusTimer);
+  statusEl.textContent = '';
+  statusTimer = setTimeout(() => { statusEl.textContent = message; }, 60);
+}
 // NOT added to the page here: see applyEnabledState / ensureMounted below.
 
 // FIX 1: some sites (e.g. ok.co.uk, built with React) rebuild the whole page just after it loads,
@@ -121,7 +136,10 @@ const mountTimer = setInterval(() => {
 function buildPanel() {
   // If the advice refreshes while someone is inside it (a new verdict arrives), keep their focus in it.
   // Rebuilding the contents would otherwise drop focus back to the page, and a screen reader loses its place.
-  const hadFocus = panel.contains(document.activeElement);
+  const focused = document.activeElement;
+  const hadFocus = panel.contains(focused);
+  const focusedRefresh = !!(hadFocus && focused.classList && focused.classList.contains('hh-panel-refresh'));
+  const focusedAudio = !!(hadFocus && !focusedRefresh && focused.classList && focused.classList.contains('hh-panel-audio'));
   panel.innerHTML = '';
 
   const header = document.createElement('div');
@@ -150,7 +168,25 @@ function buildPanel() {
     e.stopPropagation();
     speakResult();
   });
-  header.appendChild(audio);
+
+  // "Check again": same look as the speaker button (it reuses its class, so no stylesheet change is needed), placed
+  // to its right. The icon is drawn inline so it does not depend on an extra file being listed in the manifest.
+  const refresh = document.createElement('button');
+  refresh.className = 'hh-panel-audio hh-panel-refresh';
+  refresh.type = 'button';
+  refresh.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0F2D4A" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>';
+  refresh.setAttribute('aria-label', 'Check again');
+  refresh.title = 'Check again';
+  refresh.addEventListener('click', (e) => {
+    e.stopPropagation();
+    refreshNow();
+  });
+
+  const actions = document.createElement('div'); // keeps the two buttons together, on the right of the title
+  Object.assign(actions.style, { display: 'flex', gap: '8px', flexShrink: '0' });
+  actions.appendChild(audio);
+  actions.appendChild(refresh);
+  header.appendChild(actions);
 
   panel.appendChild(header);
 
@@ -169,7 +205,12 @@ function buildPanel() {
     }
   }
 
-  if (hadFocus) panel.focus();
+  // Keep keyboard focus on the same control it was on (the panel is rebuilt whenever its contents change).
+  if (focusedRefresh) refresh.focus();
+  else if (focusedAudio) audio.focus();
+  else if (hadFocus) panel.focus();
+  paintRefreshBusy();
+  positionPanel();
 }
 
 function pickVoice() {
@@ -250,6 +291,7 @@ function showPanel() {
   buildPanel();
   panel.classList.add('hh-open');
   panelOpen = true;
+  positionPanel();
   indicator.setAttribute('aria-expanded', 'true');
   panel.focus(); // move keyboard and screen-reader focus into the advice
 }
@@ -280,7 +322,128 @@ panel.addEventListener('keydown', (e) => {
 
 indicator.addEventListener('click', (e) => {
   e.stopPropagation();
+  if (Date.now() < suppressClickUntil) return; // this "click" is just the end of a drag
   panelOpen ? hidePanel() : showPanel();
+});
+
+// --- Moving the face -------------------------------------------------------------------------------------
+// Drag it (mouse, pen or touch) out of the way of an advert or anything else, and it stays where you left it, on every
+// page and in every tab. With the face focused, Shift + the arrow keys move it and Shift+Home puts it back. The advice
+// panel opens beside it, wherever it is. The position is kept in extension storage, which websites cannot read.
+const FACE_MARGIN = 8;      // never closer than this to the edge of the window
+const FACE_KEY_STEP = 24;   // pixels per Shift+arrow press
+const DRAG_START_PX = 6;    // a press that moves less than this is a click, not a drag
+let facePos = null;         // { right, bottom }: pixels from the bottom-right corner of the window; null = the default spot
+let drag = null;
+let suppressClickUntil = 0;
+let saveTimer = null;
+indicator.style.touchAction = 'none'; // so dragging with a finger moves the face instead of scrolling the page
+
+function viewportSize() {
+  return { w: document.documentElement.clientWidth, h: document.documentElement.clientHeight };
+}
+
+function currentOffsets() {
+  const r = indicator.getBoundingClientRect(), v = viewportSize();
+  return { right: v.w - r.right, bottom: v.h - r.bottom };
+}
+
+function clampFace(pos) {
+  const v = viewportSize(), r = indicator.getBoundingClientRect();
+  const w = r.width || 60, h = r.height || 60;
+  return {
+    right: Math.max(FACE_MARGIN, Math.min(pos.right, v.w - w - FACE_MARGIN)),
+    bottom: Math.max(FACE_MARGIN, Math.min(pos.bottom, v.h - h - FACE_MARGIN)),
+  };
+}
+
+// Open the advice above the face (or below it if there is no room), lined up with the side the face is on, and
+// always fully inside the window. When the face is in its default spot the stylesheet's own placement is used.
+function positionPanel() {
+  if (!panelOpen) return;
+  if (!facePos) {
+    panel.style.left = panel.style.top = panel.style.right = panel.style.bottom = '';
+    return;
+  }
+  const f = indicator.getBoundingClientRect(), v = viewportSize();
+  const pw = panel.offsetWidth, ph = panel.offsetHeight;
+  let left = (f.left + f.width / 2 > v.w / 2) ? f.right - pw : f.left;
+  left = Math.max(FACE_MARGIN, Math.min(left, v.w - pw - FACE_MARGIN));
+  let top = f.top - ph - 12;
+  if (top < FACE_MARGIN) top = f.bottom + 12;
+  top = Math.max(FACE_MARGIN, Math.min(top, v.h - ph - FACE_MARGIN));
+  Object.assign(panel.style, { left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
+}
+
+function applyFacePos() {
+  indicator.style.right = facePos ? facePos.right + 'px' : '';
+  indicator.style.bottom = facePos ? facePos.bottom + 'px' : '';
+  positionPanel();
+}
+
+function saveFacePos() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      if (facePos) chrome.storage.local.set({ facePosition: facePos });
+      else chrome.storage.local.remove('facePosition');
+    } catch (err) { /* extension was reloaded: nothing to save to */ }
+  }, 300);
+}
+
+indicator.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const o = currentOffsets();
+  drag = { id: e.pointerId, x: e.clientX, y: e.clientY, right: o.right, bottom: o.bottom, moved: false };
+  // Take hold of the pointer from the moment of the press. Otherwise a quick flick can jump clean off the face between
+  // two mouse events, before it has been "grabbed", and the drag silently never starts.
+  try { indicator.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
+});
+
+indicator.addEventListener('pointermove', (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (!drag.moved) {
+    if (Math.hypot(dx, dy) < DRAG_START_PX) return;
+    drag.moved = true;
+  }
+  facePos = clampFace({ right: drag.right - dx, bottom: drag.bottom - dy });
+  applyFacePos();
+});
+
+function endDrag(e) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const moved = drag.moved;
+  drag = null;
+  try { indicator.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+  if (!moved) return;
+  suppressClickUntil = Date.now() + 400;
+  saveFacePos();
+}
+indicator.addEventListener('pointerup', endDrag);
+indicator.addEventListener('pointercancel', endDrag);
+
+indicator.addEventListener('keydown', (e) => {
+  if (!e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.key === 'Home') { // put it back where it started
+    e.preventDefault();
+    facePos = null;
+    applyFacePos();
+    saveFacePos();
+    return;
+  }
+  const step = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+  if (!step) return;
+  e.preventDefault();
+  const o = facePos || currentOffsets();
+  facePos = clampFace({ right: o.right - step[0] * FACE_KEY_STEP, bottom: o.bottom - step[1] * FACE_KEY_STEP });
+  applyFacePos();
+  saveFacePos();
+});
+
+window.addEventListener('resize', () => {
+  if (facePos) facePos = clampFace(facePos);
+  applyFacePos(); // also re-fits an open panel to the new window size
 });
 
 document.addEventListener('click', (e) => {
@@ -311,6 +474,8 @@ function applyEnabledState() {
     if (landmark.isConnected) landmark.remove(); // gone entirely: no empty "ScrollSensay" region for screen readers
     stopChangeWatch(); // while switched off we do not watch the page at all
     clearHeldReply();
+    refreshing = false;
+    drag = null;
   } else {
     indicator.style.display = '';
     ensureMounted(); // inserted already visible, in one step (also restores it if the page deleted it while we were off)
@@ -332,13 +497,25 @@ function attemptScanUntilReady(retriesLeft = SCAN_READY_MAX_RETRIES) {
   setTimeout(() => attemptScanUntilReady(retriesLeft - 1), SCAN_READY_RETRY_DELAY);
 }
 
-chrome.storage.local.get(['enabled'], (r) => {
+chrome.storage.local.get(['enabled', 'facePosition'], (r) => {
   enabled = r.enabled === true; // opt-in: only ON if explicitly set to true
+  const fp = r.facePosition;
+  if (fp && typeof fp.right === 'number' && typeof fp.bottom === 'number') {
+    facePos = fp;
+    applyFacePos(); // applied before the face is shown, so it never flashes in the default spot first
+    facePos = clampFace(fp);
+    applyFacePos();
+  }
   applyEnabledState();
   attemptScanUntilReady(); // retry a few times in case page content hasn't rendered in yet
 });
 
 chrome.storage.onChanged.addListener((c) => {
+  if (c.facePosition && !drag) { // moved in another tab: follow it here
+    const fp = c.facePosition.newValue;
+    facePos = (fp && typeof fp.right === 'number' && typeof fp.bottom === 'number') ? clampFace(fp) : null;
+    applyFacePos();
+  }
   if (c.enabled) {
     enabled = c.enabled.newValue === true;
     applyEnabledState();
@@ -374,6 +551,7 @@ function handlePossibleNavigation() {
   stashedResult = null;
   lastChangeText = '';
   clearHeldReply();
+  refreshing = false;
   lastResult = { label: null, explanation: [] };
   pageEpoch++; // replies still in flight belong to the previous page, so they won't be shown
   setIndicator(null);
@@ -427,8 +605,8 @@ const textCache = loadCacheFromSession();
 // requests for the same screen. Now the second caller simply waits for the first one's answer.
 const pendingScans = new Map();
 
-async function callAPI(text) {
-  if (textCache.has(text)) return textCache.get(text);
+async function callAPI(text, fresh = false) {
+  if (!fresh && textCache.has(text)) return textCache.get(text); // `fresh`: really ask again, ignore what we remembered
   if (pendingScans.has(text)) return pendingScans.get(text);
 
   const request = (async () => {
@@ -596,7 +774,7 @@ function showUnavailableIfEmpty(message = MSG_FAILED) {
   if (panelOpen) buildPanel();
 }
 
-async function updateIndicator(givenText) {
+async function updateIndicator(givenText, fresh = false) {
   if (!enabled) return; // hard gate: no scan, no API call, no cost, while inactive
   const text = typeof givenText === 'string' ? givenText : getViewportText();
   if (!text || text.length < 200) { showTooLittleText(); return; }
@@ -624,12 +802,13 @@ async function updateIndicator(givenText) {
   const href = location.href;
 
   try {
-    const result = await callAPI(text);
+    const result = await callAPI(text, fresh);
     // Show it unless the user has since moved to a different page, or a newer scan already showed.
     if (result && epoch === pageEpoch && thisRequestId > lastShownRequestId) {
       if (thisRequestId === scanRequestId) showReply(thisRequestId, result, text, href);
       else holdOlderReply(thisRequestId, result, text, href, epoch); // for a screen we have moved on from: hold it back
     }
+    return 'ok';
   } catch (err) {
     console.warn('[ScrollSensay]', err.message);
     if (epoch === pageEpoch) {
@@ -639,6 +818,58 @@ async function updateIndicator(givenText) {
       }
       showUnavailableIfEmpty();
     }
+    return 'failed';
+  }
+}
+
+// --- "Check again" ----------------------------------------------------------------------------------------
+// Checks what is on screen right now and IGNORES anything remembered for it, so it really asks again. That is mostly
+// useful after "couldn't check" or "not enough text", or when the live search may have fresh news. Each press is a
+// real check (about 0.1p), so there is a short cooldown and presses are ignored while one is running.
+const REFRESH_COOLDOWN_MS = 5000;
+let refreshing = false;
+let lastRefreshAt = 0;
+let refreshSpin = null;
+
+function paintRefreshBusy() {
+  const btn = panel.querySelector('.hh-panel-refresh');
+  if (!btn) return;
+  btn.setAttribute('aria-busy', refreshing ? 'true' : 'false');
+  btn.setAttribute('aria-disabled', refreshing ? 'true' : 'false'); // not `disabled`: a disabled button would drop keyboard focus
+  btn.style.opacity = refreshing ? '0.55' : '';
+  if (refreshSpin) { refreshSpin.cancel(); refreshSpin = null; }
+  const icon = btn.querySelector('svg');
+  const calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; // no spinning for those who ask for less motion
+  if (refreshing && icon && !calm && icon.animate) {
+    refreshSpin = icon.animate([{ transform: 'rotate(0deg)' }, { transform: 'rotate(360deg)' }], { duration: 900, iterations: Infinity });
+  }
+}
+
+async function refreshNow() {
+  if (!enabled || refreshing) return;
+  if (Date.now() - lastRefreshAt < REFRESH_COOLDOWN_MS) { announce('Please wait a moment before checking again.'); return; }
+  lastRefreshAt = Date.now();
+  const text = getViewportText();
+  if (!text || text.length < 200) { showTooLittleText(); announce('Not enough text on screen to check.'); return; }
+
+  const epoch = pageEpoch;
+  const previousText = lastViewportText;
+  const hadVerdict = !!lastResult.label && lastResult.label !== 'unavailable';
+  refreshing = true;
+  paintRefreshBusy();
+  announce('Checking again…');
+  lastViewportText = '';   // forget "this is the screen we already checked" so the check is not skipped
+  stashedResult = null;
+  clearHeldReply();
+  const outcome = await updateIndicator(text, true);
+  if (epoch !== pageEpoch) return; // the page changed meanwhile; navigation already reset everything
+  refreshing = false;
+  paintRefreshBusy();
+  if (outcome === 'failed') {
+    if (!lastViewportText) lastViewportText = previousText;
+    announce(hadVerdict ? "Couldn't check again just now. The earlier result is still showing." : "Couldn't check just now.");
+  } else {
+    announce(lastResult.label === 'unavailable' ? "Couldn't check just now." : 'Updated. ' + (SIGNAL_WORDS[lastResult.label] || ''));
   }
 }
 
