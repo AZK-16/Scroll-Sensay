@@ -6,7 +6,7 @@ const SCROLL_DEBOUNCE = 2200;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-6-triggers-3';
+const BUILD = 'a11y-merge-6-steady-1';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
@@ -15,6 +15,7 @@ const MSG_TOO_LITTLE = "Not enough text on screen to check. Scroll to the main s
 
 let enabled = false;
 let lastViewportText = '';
+let checkingCue = false; // true while a verdict for the text now on screen is on its way (see setCheckingCue)
 let lastViewportHref = ''; // the full address (including the part after #) the verdict on display belongs to
 let lastResult = { label: null, explanation: [] };
 let panelOpen = false;
@@ -51,7 +52,7 @@ const SIGNAL_WORDS = {
 };
 
 function setIndicatorLabel(label) {
-  const words = SIGNAL_WORDS[label] || 'Still scanning';
+  const words = checkingCue ? 'Checking this part of the page' : (SIGNAL_WORDS[label] || 'Still scanning');
   indicator.setAttribute('aria-label', 'ScrollSensay: ' + words + '. Open advice');
 }
 setIndicatorLabel(null);
@@ -131,7 +132,8 @@ function buildPanel() {
   const title = document.createElement('div');
   title.className = 'hh-panel-title';
   title.id = 'hh-panel-title'; // names the dialog (see aria-labelledby above)
-  title.textContent = lastResult.label === null ? "Sensay's Advice:\nStill scanning…"
+  title.textContent = checkingCue ? "Sensay's Advice:\nChecking this part of the page…"
+    : lastResult.label === null ? "Sensay's Advice:\nStill scanning…"
     : lastResult.label === 'unavailable' ? "Sensay's Advice:\nCouldn't check this just now"
     : lastResult.label === 'green' ? "Sensay's Advice:\nNo major concerns"
     : lastResult.label === 'amber' ? "Sensay's Advice:\nWorth a second look"
@@ -153,7 +155,7 @@ function buildPanel() {
 
   panel.appendChild(header);
 
-  if (lastResult.label !== null) {
+  if (lastResult.label !== null && !checkingCue) {
     const divider = document.createElement('div');
     divider.className = 'hh-panel-divider';
     panel.appendChild(divider);
@@ -284,6 +286,8 @@ function applyEnabledState() {
     indicator.style.display = 'none';
     if (landmark.isConnected) landmark.remove(); // gone entirely: no empty "ScrollSensay" region for screen readers
     stopChangeWatch(); // while switched off we do not watch the page at all
+    clearHeldReply();
+    setCheckingCue(false);
   } else {
     indicator.style.display = '';
     ensureMounted(); // inserted already visible, in one step (also restores it if the page deleted it while we were off)
@@ -346,6 +350,8 @@ function handlePossibleNavigation() {
   lastViewportHref = '';
   stashedResult = null;
   lastChangeText = '';
+  clearHeldReply();
+  setCheckingCue(false);
   lastResult = { label: null, explanation: [] };
   pageEpoch++; // replies still in flight belong to the previous page, so they won't be shown
   setIndicator(null);
@@ -492,6 +498,68 @@ let lastShownRequestId = 0;
 // check, and without cost) if the reader scrolls back to the text it was for.
 let stashedResult = null; // { result, text }
 
+// --- Steady verdicts ---------------------------------------------------------------------------------------
+// Problem: you scroll on to the next post while the check for the previous one is still running. Its late answer
+// used to be shown at once (for text you had already left), and then the right answer replaced it moments later,
+// so the face jumped from, say, red to green. Now:
+//  - while a check for the screen you are on is on its way, the old verdict is DIMMED and described as "checking";
+//  - an answer for a screen you have moved on from is held back for a few seconds instead of flashing up;
+//  - if the newest check is slow, the held answer is shown DIMMED after HOLD_OLDER_MS, so there is never just a blank;
+//  - if the newest check fails, the held answer is used, as before.
+// Nothing here changes what is sent to Gemini or what comes back.
+const HOLD_OLDER_MS = 4000;
+let heldReply = null; // { id, result, text, href, epoch }
+let heldTimer = null;
+
+function setCheckingCue(on) {
+  if (on === checkingCue) return;
+  checkingCue = on;
+  indicator.style.opacity = on ? '0.5' : '';
+  indicator.style.filter = on ? 'grayscale(0.85)' : '';
+  setIndicatorLabel(lastResult.label); // what screen readers hear stays in step with the face
+  if (panelOpen) buildPanel();
+}
+
+function clearHeldReply() {
+  clearTimeout(heldTimer);
+  heldTimer = null;
+  heldReply = null;
+}
+
+function holdOlderReply(id, result, text, href, epoch) {
+  if (heldReply && heldReply.id > id) return; // we already hold a newer one
+  clearTimeout(heldTimer);
+  heldReply = { id, result, text, href, epoch };
+  heldTimer = setTimeout(() => showHeldReply(false), HOLD_OLDER_MS);
+}
+
+// `final` = true when the newest check has failed (nothing better is coming), so the held answer is simply shown.
+function showHeldReply(final) {
+  const h = heldReply;
+  clearHeldReply();
+  if (!h || h.epoch !== pageEpoch || h.id <= lastShownRequestId) return;
+  lastShownRequestId = h.id;
+  lastViewportText = h.text;
+  lastViewportHref = h.href;
+  lastResult = h.result;
+  stashedResult = null;
+  if (final) setCheckingCue(false); // otherwise it stays dimmed: a newer check is still on its way
+  setIndicator(h.result.label);
+  if (panelOpen) buildPanel();
+}
+
+function showReply(id, result, text, href) {
+  clearHeldReply();
+  lastShownRequestId = id;
+  lastViewportText = text;
+  lastViewportHref = href;
+  lastResult = result;
+  stashedResult = null; // a newer verdict replaces any older one we were holding on to
+  setCheckingCue(false);
+  setIndicator(result.label);
+  if (panelOpen) buildPanel();
+}
+
 function sameScreen(a, b) {
   return !!a && !!b && (a === b || a.slice(0, 500) === b.slice(0, 500));
 }
@@ -501,6 +569,8 @@ function sameScreen(a, b) {
 // those still never replace a good verdict; see showUnavailableIfEmpty.)
 function showTooLittleText() {
   lastShownRequestId = scanRequestId; // replies for screens we have already left must not cover this message
+  clearHeldReply();
+  setCheckingCue(false);
   if (lastResult.label === 'unavailable' && lastResult.explanation[0] === MSG_TOO_LITTLE) return; // already showing it
   if (lastResult.label && lastResult.label !== 'unavailable') stashedResult = { result: lastResult, text: lastViewportText, href: lastViewportHref };
   lastViewportText = ''; // so the next screen with real text is checked, or the stashed verdict is restored
@@ -528,32 +598,43 @@ async function updateIndicator(givenText) {
     lastViewportHref = stashedResult.href;
     stashedResult = null;
     lastShownRequestId = scanRequestId;
+    clearHeldReply();
+    setCheckingCue(false);
     setIndicator(lastResult.label);
     if (panelOpen) buildPanel();
     return;
   }
-  if (text === lastViewportText) return;
-  if (lastViewportText && text.slice(0, 500) === lastViewportText.slice(0, 500)) return;
-
+  if (text === lastViewportText || (lastViewportText && text.slice(0, 500) === lastViewportText.slice(0, 500))) {
+    // Back on the text the displayed verdict is for: it is current again, and any answers still on their way
+    // for screens we passed through are now obsolete.
+    lastShownRequestId = scanRequestId;
+    clearHeldReply();
+    setCheckingCue(false);
+    return;
+  }
   const thisRequestId = ++scanRequestId;
   const epoch = pageEpoch;
   const href = location.href;
+  // A verdict for the PREVIOUS text is still on display: mark it as out of date until the new one arrives.
+  if (lastResult.label && lastResult.label !== 'unavailable') setCheckingCue(true);
 
   try {
     const result = await callAPI(text);
     // Show it unless the user has since moved to a different page, or a newer scan already showed.
     if (result && epoch === pageEpoch && thisRequestId > lastShownRequestId) {
-      lastShownRequestId = thisRequestId;
-      lastViewportText = text;
-      lastViewportHref = href;
-      lastResult = result;
-      stashedResult = null; // a newer verdict replaces any older one we were holding on to
-      setIndicator(result.label);
-      if (panelOpen) buildPanel();
+      if (thisRequestId === scanRequestId) showReply(thisRequestId, result, text, href);
+      else holdOlderReply(thisRequestId, result, text, href, epoch); // for a screen we have moved on from: hold it back
     }
   } catch (err) {
     console.warn('[ScrollSensay]', err.message);
-    if (epoch === pageEpoch) showUnavailableIfEmpty();
+    if (epoch === pageEpoch) {
+      if (thisRequestId === scanRequestId) {
+        // The newest check failed: nothing better is coming, so fall back on the best earlier answer (as before).
+        if (heldReply) showHeldReply(true);
+        setCheckingCue(false);
+      }
+      showUnavailableIfEmpty();
+    }
   }
 }
 
@@ -572,8 +653,21 @@ window.addEventListener('scroll', (e) => {
   lastScrollAt = Date.now();
   ensureMounted(); // FIX 1
   clearTimeout(scrollTimer);
-  scrollTimer = setTimeout(updateIndicator, SCROLL_DEBOUNCE);
+  scrollTimer = setTimeout(() => settleThenCheck(getViewportText(), 0), Math.max(0, SCROLL_DEBOUNCE - SETTLE_LOOK_MS));
 }, { passive: true, capture: true });
+
+// Before sending a check, make sure the text has STOPPED changing (a post still loading its text or images would
+// otherwise be checked half-finished, then again when it finishes). We look once near the end of the pause and once
+// at the end of it; if both agree, go. So there is no extra wait unless the page really is still changing, and then
+// at most two more half-seconds.
+const SETTLE_LOOK_MS = 500;
+function settleThenCheck(before, tries) {
+  scrollTimer = setTimeout(() => {
+    const now = getViewportText();
+    if (now === before || tries >= 2) updateIndicator(now);
+    else settleThenCheck(now, tries + 1);
+  }, SETTLE_LOOK_MS);
+}
 
 // 2) The text on screen changing WITHOUT any scrolling: opening the next email, clicking to another post, a
 //    view that finishes loading. Nothing announces that, and apps that route with #hash do not even count as a
