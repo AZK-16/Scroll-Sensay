@@ -6,7 +6,7 @@ const SCROLL_DEBOUNCE = 2200;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-6-steady-2';
+const BUILD = 'a11y-merge-6-steady-4';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
@@ -57,6 +57,7 @@ function setIndicatorLabel(label) {
 setIndicatorLabel(null);
 
 function setIndicator(label) {
+  stopStaleSpeech(); // the verdict on the face may just have changed: do not carry on reading out the old one
   ensureMounted();
   indicator.classList.remove('hh-green', 'hh-amber', 'hh-red');
   if (label === 'green')      { indicator.classList.add('hh-green'); indicatorEmoji.textContent = '😊'; }
@@ -192,9 +193,28 @@ function pickVoice() {
     || null;
 }
 
+// The reasons being read aloud belong to ONE verdict. If a different verdict replaces it on the face (a new check
+// finished, you moved on to another post, the page changed, "not enough text"...), reading must stop, instead of
+// carrying on with reasons that are no longer on screen. We only ever cancel speech that is OURS.
+let speakingUtterance = null; // the read-aloud utterance that is playing, if it is ours
+let speakingResult = null;    // the verdict (lastResult) it is reading
+
+function stopOurSpeech() {
+  if (!speakingUtterance) return; // nothing of ours is playing: leave the browser's speech (and the website's) alone
+  speakingUtterance = null;
+  speakingResult = null;
+  try { speechSynthesis.cancel(); } catch (err) { /* nothing to stop */ }
+}
+
+function stopStaleSpeech() {
+  if (speakingUtterance && speakingResult !== lastResult) stopOurSpeech();
+}
+
 function speakResult() {
   if (!window.speechSynthesis) return;
   if (speechSynthesis.speaking) {
+    speakingUtterance = null;
+    speakingResult = null;
     speechSynthesis.cancel();
     return;
   }
@@ -206,6 +226,11 @@ function speakResult() {
   if (voice) u.voice = voice;
   u.lang = 'en-GB';
   u.rate = 0.95;
+  speakingUtterance = u;
+  speakingResult = lastResult;
+  const finished = () => { if (speakingUtterance === u) { speakingUtterance = null; speakingResult = null; } };
+  u.onend = finished;
+  u.onerror = finished;
   speechSynthesis.speak(u);
 }
 
@@ -230,6 +255,7 @@ function showPanel() {
 }
 
 function hidePanel(returnFocus) {
+  stopOurSpeech(); // closing the advice also stops it being read aloud
   const hadFocus = panel.contains(document.activeElement);
   panel.classList.remove('hh-open');
   panelOpen = false;
