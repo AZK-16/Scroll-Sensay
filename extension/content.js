@@ -6,7 +6,7 @@ const SCROLL_DEBOUNCE = 2200;
 
 // Which copy of this file is running? Printed in the page console (F12) on every load,
 // so an old or wrong copy of content.js is obvious in seconds.
-const BUILD = 'a11y-merge-6-refresh-1';
+const BUILD = 'a11y-merge-6-refresh-2';
 console.info('[ScrollSensay] content.js loaded, build ' + BUILD);
 
 // Messages shown on the grey "no verdict" face.
@@ -174,7 +174,7 @@ function buildPanel() {
   const refresh = document.createElement('button');
   refresh.className = 'hh-panel-audio hh-panel-refresh';
   refresh.type = 'button';
-  refresh.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0F2D4A" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>';
+  refresh.innerHTML = '<svg width="18" height="18" viewBox="1.4 1.4 21.2 21.2" fill="none" stroke="#000000" stroke-width="2.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>';
   refresh.setAttribute('aria-label', 'Check again');
   refresh.title = 'Check again';
   refresh.addEventListener('click', (e) => {
