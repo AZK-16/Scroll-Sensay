@@ -57,6 +57,16 @@
 #hh-indicator.hh-red   { background-color: #ef4444 !important; }
 .hh-panel-audio { background-color: #e2e8f0 !important; }
 
+/* FIX 7: the "Check again" icon is an inline SVG, so a site's own CSS can reach inside it. Some sites
+   (e.g. tattle.life) fill every svg with the text colour, which turned the ring into a solid black blob.
+   !important keeps the icon an outline (no fill, black line) whatever the site says. */
+#hh-panel .hh-panel-refresh svg,
+#hh-panel .hh-panel-refresh svg * {
+  fill: none !important;
+  stroke: #000000 !important;
+  stroke-width: 2.9px !important;
+}
+
 #hh-panel {
   position: fixed;
   bottom: 120px;
